@@ -1,0 +1,1219 @@
+<html lang="th" __gchrome_remoteframetoken="952f36a6a0d20f65e7e8a748162a667c"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>📚 ก.พ. 2569 Study Planner</title>
+<style>@import url('https://fonts.googleapis.com/css2?family=Mitr:wght@400;500;600;700&family=Sarabun:wght@300;400;500;600&display=swap');</style>
+<style>
+:root {
+  --cream:#fdf6ec; --pink:#f9d5e0; --pink-mid:#f0a8bb; --pink-deep:#d9638a;
+  --mint:#d4f0e8; --mint-mid:#90d4be; --mint-deep:#3aaa8c;
+  --lav:#e8dff5; --lav-mid:#b8a0d8; --lav-deep:#7050b0;
+  --sky:#d5eaf9; --sky-mid:#90c4e8; --sky-deep:#3a88c8;
+  --peach:#fde8d0; --peach-mid:#f8c090; --peach-deep:#d87030;
+  --yell:#fff8d0; --yell-mid:#f0d870; --yell-deep:#b89a10;
+  --navy:#2a2c4e; --text:#3a3c5a; --muted:#9090b8;
+  --sh1:0 2px 14px rgba(80,80,140,0.09);
+  --sh2:0 6px 28px rgba(80,80,140,0.14);
+  --r:18px; --rsm:11px;
+}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{font-family:'Sarabun',sans-serif;background:#fdf6ec;min-height:100vh;color:#3a3c5a;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
+  background:
+    radial-gradient(ellipse 600px 400px at 5% 15%,rgba(249,213,224,0.45) 0%,transparent 65%),
+    radial-gradient(ellipse 500px 380px at 92% 82%,rgba(212,240,232,0.45) 0%,transparent 65%),
+    radial-gradient(ellipse 400px 300px at 55% 50%,rgba(232,223,245,0.28) 0%,transparent 65%)}
+#app{position:relative;z-index:1;max-width:1080px;margin:0 auto;padding:0 0 98px}
+.hdr{padding:26px 22px 0;display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap}
+.hdr-l h1{font-family:'Mitr',sans-serif;font-size:22px;font-weight:700;color:#2a2c4e;line-height:1.25}
+.hdr-l p{font-size:12px;color:#9090b8;margin-top:3px}
+.hdr-badge{background:#c090cc;color:#fff;font-size:11px;font-weight:700;padding:5px 14px;border-radius:20px;letter-spacing:1px;white-space:nowrap;box-shadow:0 3px 12px #c090cc55;align-self:flex-start}
+.mpwrap{margin:13px 22px 0;background:#ffffffb3;border-radius:99px;height:9px;overflow:hidden;box-shadow:inset 0 1px 4px rgba(0,0,0,0.06)}
+.mpfill{height:100%;background:linear-gradient(90deg,#f0a8bb,#f8c090,#f0d870);border-radius:99px;transition:width .5s ease}
+.mplabel{margin:5px 22px 0;font-size:11px;color:#9090b8;display:flex;justify-content:space-between}
+.tabbar{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:1080px;
+padding:9px 14px 13px;display:flex;gap:5px;
+background:#fdf6ec;backdrop-filter:blur(24px);
+border-top:1px solid rgba(255,255,255,0.85);z-index:999;
+box-shadow:0 -4px 22px rgba(80,80,140,0.09)}
+.tbtn{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;
+padding:7px 4px;border:none;background:transparent;border-radius:11px;
+cursor:pointer;transition:all .2s;position:relative}
+.tbtn .ti{font-size:19px;line-height:1;position:relative;z-index:1}
+.tbtn .tl{font-size:10px;font-family:'Mitr',sans-serif;font-weight:500;color:#9090b8;position:relative;z-index:1;transition:color .2s}
+.tbtn.active .tl{color:#2a2c4e;font-weight:700}
+.tbtn::before{content:'';position:absolute;inset:0;border-radius:11px;opacity:0;transition:opacity .2s}
+.tbtn.active::before{opacity:1}
+.tbtn:nth-child(1)::before{background:#f9d5e0}
+.tbtn:nth-child(2)::before{background:#d4f0e8}
+.tbtn:nth-child(3)::before{background:#e8dff5}
+.tbtn:nth-child(4)::before{background:#fde8d0}
+.tbtn:nth-child(5)::before{background:#d5eaf9}
+.tbtn:nth-child(6)::before{background:#fff8d0}
+.page{display:none;padding:18px 18px 0;animation:fadeUp .28s ease}
+.page.active{display:block}
+@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.sectitle{font-family:'Mitr',sans-serif;font-size:18px;font-weight:700;color:#2a2c4e;margin-bottom:14px;display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.pill{font-size:10px;font-weight:500;padding:3px 11px;border-radius:20px;background:#e8dff5;color:#7050b0;font-family:'Sarabun',sans-serif}
+.cal-grid{display:flex;flex-direction:column;gap:9px}
+.dcard{background:#fff;border-radius:18px;box-shadow:0 2px 14px rgba(80,80,140,0.09);overflow:hidden;border:1.5px solid rgba(255,255,255,0.92);transition:box-shadow .2s}
+.dcard:hover{box-shadow:0 6px 28px rgba(80,80,140,0.14)}
+.dhdr{display:flex;align-items:center;gap:11px;padding:12px 15px;cursor:pointer;user-select:none}
+.dbox{min-width:48px;height:48px;border-radius:13px;display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:'Mitr',sans-serif;flex-shrink:0}
+.dbox .dn{font-size:19px;font-weight:700;line-height:1}
+.dbox .dm{font-size:9px;opacity:.75}
+.dinfo{flex:1;min-width:0}
+.dtitle{font-size:13px;font-weight:600;color:#2a2c4e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dsub{font-size:11px;color:#9090b8;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dprog{width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;flex-shrink:0}
+.dchev{font-size:15px;color:#9090b8;transition:transform .25s;flex-shrink:0;margin-left:1px}
+.dcard.open .dchev{transform:rotate(90deg)}
+.dslots{display:none;padding:0 13px 13px;flex-direction:column;gap:7px}
+.dcard.open .dslots{display:flex}
+.scard{border-radius:11px;padding:10px 13px;position:relative}
+.scard::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;border-radius:4px 0 0 4px}
+.scard.morning{background:#fde8f0}.scard.morning::before{background:#f0a8bb}
+.scard.afternoon{background:#ede5f8}.scard.afternoon::before{background:#b8a0d8}
+.scard.evening{background:#e2f5ef}.scard.evening::before{background:#90d4be}
+.stime{font-size:10px;font-weight:700;letter-spacing:.7px;margin-bottom:3px;margin-left:2px}
+.scard.morning .stime{color:#d9638a}.scard.afternoon .stime{color:#7050b0}.scard.evening .stime{color:#3aaa8c}
+.stitle{font-size:12px;font-weight:600;color:#2a2c4e;margin-bottom:5px;margin-left:2px}
+.task{display:flex;align-items:center;gap:8px;padding:3px 0}
+.chk{width:20px;height:20px;min-width:20px;border-radius:6px;border:2px solid #ddd;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .15s;background:#fff;font-size:12px;font-weight:700;color:#fff;flex-shrink:0}
+.chk.on{border:none}
+.scard.morning .chk.on{background:#f0a8bb}
+.scard.afternoon .chk.on{background:#b8a0d8}
+.scard.evening .chk.on{background:#90d4be}
+.tlabel{font-size:12px;transition:all .15s}
+.tlabel.on{color:#9090b8;text-decoration:line-through}
+.dc-pink .dbox,.dc-pink .dprog{background:#f9d5e0 !important;color:#d9638a !important}
+.dc-mint .dbox,.dc-mint .dprog{background:#d4f0e8 !important;color:#3aaa8c !important}
+.dc-lavender .dbox,.dc-lavender .dprog{background:#e8dff5 !important;color:#7050b0 !important}
+.dc-peach .dbox,.dc-peach .dprog{background:#fde8d0 !important;color:#d87030 !important}
+.dc-sky .dbox,.dc-sky .dprog{background:#d5eaf9 !important;color:#3a88c8 !important}
+.dc-yellow .dbox,.dc-yellow .dprog{background:#fff8d0 !important;color:#b89a10 !important}
+.subjbar{display:flex;gap:7px;margin-bottom:14px;flex-wrap:wrap}
+.stab{padding:6px 16px;border-radius:20px;border:2px solid transparent;font-size:13px;font-weight:600;cursor:pointer;transition:all .18s;font-family:'Mitr',sans-serif;background:#fff;color:#9090b8}
+.stab.active{color:#2a2c4e;transform:translateY(-1px);box-shadow:0 2px 14px rgba(80,80,140,0.09)}
+.stab[data-s=math].active{background:#f9d5e0;border-color:#f0a8bb}
+.stab[data-s=law].active{background:#e8dff5;border-color:#b8a0d8}
+.stab[data-s=eng].active{background:#d4f0e8;border-color:#90d4be}
+.spanel{display:none}.spanel.active{display:block;animation:fadeUp .22s ease}
+.tsec{background:#fff;border-radius:18px;padding:14px 16px;margin-bottom:11px;box-shadow:0 2px 14px rgba(80,80,140,0.09)}
+.tsectitle{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px}
+.tsectitle.pink{color:#d9638a}.tsectitle.lavender{color:#7050b0}.tsectitle.mint{color:#3aaa8c}.tsectitle.peach{color:#d87030}.tsectitle.sky{color:#3a88c8}
+.tdone-lbl{font-size:11px;color:#9090b8;margin-top:-2px;margin-bottom:9px}
+.titem{display:flex;align-items:center;gap:9px;padding:5px 0;border-bottom:1px solid rgba(0,0,0,0.04)}
+.titem:last-child{border-bottom:none}
+.tchk{width:22px;height:22px;min-width:22px;border-radius:7px;border:2px solid #e0e0ee;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .15s;background:#fff;font-size:13px;font-weight:700;color:#fff;flex-shrink:0}
+.tchk.on{border:none}
+.smath .tchk.on{background:#f0a8bb}.slaw .tchk.on{background:#b8a0d8}.seng .tchk.on{background:#90d4be}
+.ttext{font-size:13px;transition:all .15s}
+.ttext.on{color:#9090b8;text-decoration:line-through}
+.prog-overall{background:linear-gradient(135deg,#2a2c4e 0%,#3a4080 100%);border-radius:18px;padding:24px 20px;margin-bottom:16px;color:#fff;display:flex;align-items:center;gap:20px;box-shadow:0 6px 28px rgba(80,80,140,0.14);position:relative;overflow:hidden}
+.prog-overall::before{content:'';position:absolute;right:-30px;top:-30px;width:160px;height:160px;border-radius:50%;background:rgba(255,255,255,0.04)}
+.pring-wrap{position:relative;width:90px;height:90px;flex-shrink:0}
+.pring-wrap svg{transform:rotate(-90deg)}
+.pring-txt{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.pring-pct{font-family:'Mitr',sans-serif;font-size:22px;font-weight:700;line-height:1}
+.pring-lbl{font-size:10px;opacity:.7;margin-top:2px}
+.pov-info h2{font-family:'Mitr',sans-serif;font-size:16px;font-weight:600}
+.pov-info p{font-size:12px;opacity:.8;margin-top:2px}
+.pov-counts{font-size:26px;font-weight:700;font-family:'Mitr',sans-serif;margin-top:4px}
+.pcards{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:12px}
+.pcard{background:#fff;border-radius:18px;padding:16px;box-shadow:0 2px 14px rgba(80,80,140,0.09)}
+.pcard-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:11px}
+.pcard-title{font-size:14px;font-weight:700;color:#2a2c4e;font-family:'Mitr',sans-serif}
+.pcard-pct{font-size:21px;font-weight:700;font-family:'Mitr',sans-serif}
+.cp .pcard-pct{color:#d9638a}.cl .pcard-pct{color:#7050b0}.cm .pcard-pct{color:#3aaa8c}
+.pbar-wrap{height:9px;background:#f0eef8;border-radius:99px;overflow:hidden;margin-bottom:12px}
+.pbar-fill{height:100%;border-radius:99px;transition:width .5s ease}
+.cp .pbar-fill{background:linear-gradient(90deg,#f0a8bb,#f8c090)}
+.cl .pbar-fill{background:linear-gradient(90deg,#b8a0d8,#90c4e8)}
+.cm .pbar-fill{background:linear-gradient(90deg,#90d4be,#f0d870)}
+.psrow{display:flex;align-items:center;gap:7px;font-size:11px;margin-bottom:5px}
+.psname{flex:1.2;color:#3a3c5a}
+.psmini-w{flex:1;height:5px;background:#f0f0f8;border-radius:99px;overflow:hidden}
+.psmini{height:100%;border-radius:99px;transition:width .4s ease}
+.cp .psmini{background:#f0a8bb}.cl .psmini{background:#b8a0d8}.cm .psmini{background:#90d4be}
+.psval{color:#9090b8;min-width:38px;text-align:right}
+.cd-hero{background:linear-gradient(135deg,#f9d5e0 0%,#e8dff5 50%,#d4f0e8 100%);border-radius:18px;padding:32px 22px;text-align:center;margin-bottom:16px;box-shadow:0 6px 28px rgba(80,80,140,0.14);position:relative;overflow:hidden}
+.cd-hero::after{content:'🎯';position:absolute;right:18px;top:14px;font-size:56px;opacity:.18}
+.cd-pre{font-size:10px;font-weight:700;color:#9090b8;letter-spacing:2px;text-transform:uppercase;margin-bottom:5px}
+.cd-ttl{font-family:'Mitr',sans-serif;font-size:20px;font-weight:700;color:#2a2c4e;margin-bottom:3px}
+.cd-dstr{font-size:12px;color:#9090b8;margin-bottom:24px}
+.cd-nums{display:flex;justify-content:center;gap:9px;flex-wrap:wrap}
+.cdu{background:#fff;border-radius:11px;padding:13px 16px;min-width:70px;text-align:center;box-shadow:0 2px 14px rgba(80,80,140,0.09)}
+.cdn{font-family:'Mitr',sans-serif;font-size:32px;font-weight:700;line-height:1;color:#2a2c4e}
+.cdul{font-size:10px;color:#9090b8;margin-top:2px;font-weight:600}
+.ud .cdn{color:#d9638a}.uh .cdn{color:#7050b0}.um .cdn{color:#3aaa8c}.us .cdn{color:#d87030}
+.cd-ms-wrap{background:#fff;border-radius:18px;padding:16px;box-shadow:0 2px 14px rgba(80,80,140,0.09)}
+.cdm{display:flex;align-items:center;gap:11px;padding:9px 0;border-bottom:1px solid rgba(0,0,0,0.05)}
+.cdm:last-child{border-bottom:none}
+.cdmdot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.cdmdot.dp{background:#f0a8bb}.cdmdot.dl{background:#b8a0d8}.cdmdot.dm{background:#90d4be}.cdmdot.dpe{background:#f8c090}.cdmdot.ds{background:#90c4e8}.cdmdot.done{background:#90d890}
+.cdmi{flex:1}
+.cdmname{font-size:13px;font-weight:600;color:#2a2c4e}
+.cdmd{font-size:11px;color:#9090b8;margin-top:1px}
+.cdmleft{font-size:12px;font-weight:700;white-space:nowrap}
+.cdmleft.past{color:#3aaa8c}.cdmleft.today{color:#d9638a}.cdmleft.soon{color:#d87030}.cdmleft.far{color:#3a88c8}
+.timer-page{text-align:center}
+.timer-hero{background:linear-gradient(135deg,#d5eaf9 0%,#d4f0e8 100%);border-radius:18px;padding:34px 22px;margin-bottom:16px;box-shadow:0 6px 28px rgba(80,80,140,0.14);position:relative;overflow:hidden}
+.timer-hero::before{content:'⏱️';position:absolute;right:18px;top:14px;font-size:50px;opacity:.2}
+.tdisp{font-family:'Mitr',sans-serif;font-size:64px;font-weight:700;color:#2a2c4e;letter-spacing:3px;line-height:1;margin-bottom:5px}
+.tdisp.urgent{color:#d9638a;animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
+.tsub{font-size:12px;color:#9090b8;margin-bottom:20px}
+.tpw{height:7px;background:rgba(255,255,255,0.5);border-radius:99px;overflow:hidden;max-width:360px;margin:0 auto 18px}
+.tpf{height:100%;border-radius:99px;background:linear-gradient(90deg,#90c4e8,#90d4be);transition:width 1s linear}
+.tbtns{display:flex;gap:9px;justify-content:center;flex-wrap:wrap}
+.tbtn2{padding:11px 24px;border-radius:13px;border:none;font-size:14px;font-weight:700;cursor:pointer;font-family:'Mitr',sans-serif;transition:all .18s;box-shadow:0 2px 14px rgba(80,80,140,0.09)}
+.tbtn2:active{transform:scale(.96)}
+.bt-start{background:#2a2c4e;color:#fff}.bt-pause{background:#fde8d0;color:#d87030}.bt-reset{background:#f9d5e0;color:#d9638a}
+.presets{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:9px;margin-bottom:16px}
+.pset{background:#fff;border-radius:11px;padding:13px 15px;cursor:pointer;border:2px solid transparent;box-shadow:0 2px 14px rgba(80,80,140,0.09);text-align:left;transition:all .18s}
+.pset:hover{border-color:#90c4e8;transform:translateY(-2px)}
+.pset.pactive{border-color:#3a88c8;background:#d5eaf9}
+.pset-name{font-size:13px;font-weight:700;color:#2a2c4e;font-family:'Mitr',sans-serif}
+.pset-detail{font-size:11px;color:#9090b8;margin-top:1px}
+.pset-time{font-size:18px;font-weight:700;color:#3a88c8;font-family:'Mitr',sans-serif;margin-top:4px}
+.mlog{background:#fff;border-radius:18px;padding:15px 16px;box-shadow:0 2px 14px rgba(80,80,140,0.09);text-align:left}
+.mlog-title{font-size:14px;font-weight:700;color:#2a2c4e;font-family:'Mitr',sans-serif;margin-bottom:10px}
+.log-empty{font-size:13px;color:#9090b8;text-align:center;padding:12px}
+.logbadge{font-size:11px;padding:2px 9px;border-radius:99px;font-weight:600}
+.lb-done{background:#d4f0e8;color:#3aaa8c}.lb-pause{background:#fde8d0;color:#d87030}
+.recaptabs{display:flex;gap:7px;margin-bottom:14px;flex-wrap:wrap}
+.rtab{padding:6px 16px;border-radius:20px;border:2px solid transparent;font-size:13px;font-weight:600;cursor:pointer;transition:all .18s;font-family:'Mitr',sans-serif;background:#fff;color:#9090b8}
+.rtab.active{color:#2a2c4e;transform:translateY(-1px);box-shadow:0 2px 14px rgba(80,80,140,0.09)}
+.rtab[data-r=rmath].active{background:#f9d5e0;border-color:#f0a8bb}
+.rtab[data-r=rlaw].active{background:#e8dff5;border-color:#b8a0d8}
+.rtab[data-r=reng].active{background:#d4f0e8;border-color:#90d4be}
+.rtab[data-r=rtip].active{background:#fde8d0;border-color:#f8c090}
+.rpanel{display:none}.rpanel.active{display:block;animation:fadeUp .22s ease}
+.fgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:11px}
+.fc{background:#fff;border-radius:11px;padding:14px 16px;box-shadow:0 2px 14px rgba(80,80,140,0.09);transition:all .18s}
+.fc:hover{transform:translateY(-2px);box-shadow:0 6px 28px rgba(80,80,140,0.14)}
+.ftopic{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px}
+.ftopic.pink{color:#d9638a}.ftopic.lav{color:#7050b0}.ftopic.mint{color:#3aaa8c}.ftopic.peach{color:#d87030}.ftopic.sky{color:#3a88c8}
+.fmain{font-family:'Mitr',sans-serif;font-size:14px;font-weight:600;color:#2a2c4e;background:#fdf6ec;border-radius:7px;padding:7px 10px;margin-bottom:6px;border-left:3px solid #f0a8bb;line-height:1.6}
+.fnote{font-size:11px;color:#9090b8;line-height:1.65}
+.fex{margin-top:6px;font-size:11px;background:rgba(248,192,144,0.18);border-radius:5px;padding:5px 8px;color:#d87030;font-weight:600}
+.tiplist{display:flex;flex-direction:column;gap:10px}
+.tipc{background:#fff;border-radius:11px;padding:14px 16px;box-shadow:0 2px 14px rgba(80,80,140,0.09);border-left:4px solid;transition:all .18s}
+.tipc:hover{transform:translateY(-2px);box-shadow:0 6px 28px rgba(80,80,140,0.14)}
+.tipc.tlaw{border-color:#b8a0d8}.tipc.teng{border-color:#90d4be}.tipc.tlogic{border-color:#f8c090}.tipc.tmath{border-color:#f0a8bb}
+.tipbadge{display:inline-block;font-size:10px;font-weight:700;padding:2px 9px;border-radius:99px;margin-bottom:5px}
+.tlaw .tipbadge{background:#e8dff5;color:#7050b0}.teng .tipbadge{background:#d4f0e8;color:#3aaa8c}
+.tlogic .tipbadge{background:#fde8d0;color:#d87030}.tmath .tipbadge{background:#f9d5e0;color:#d9638a}
+.tiptitle{font-size:14px;font-weight:700;color:#2a2c4e;font-family:'Mitr',sans-serif;margin-bottom:6px}
+.tipbody{font-size:12px;color:#3a3c5a;line-height:1.75}
+.tipbody li{margin-bottom:3px;padding-left:2px}
+.hl{background:#fff8d0;color:#b89a10;padding:1px 6px;border-radius:4px;font-weight:700}
+@media(max-width:600px){.tdisp{font-size:48px}.cdn{font-size:26px}.cdu{min-width:58px;padding:10px 12px}}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<div id="app">
+  <div class="hdr">
+    <div class="hdr-l">
+      <h1>📚 ก.พ. 2569 Study Planner</h1>
+      <p>4 มีนาคม 2569 – 5 กรกฎาคม 2569 · iPad Edition ✨</p>
+    </div>
+    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px">
+      <div class="hdr-badge">ก.พ. PREP</div>
+      <button id="save-btn" onclick="saveProgress()" style="background:#d4f0e8;color:#3aaa8c;border:none;border-radius:12px;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;font-family:Mitr,sans-serif;white-space:nowrap;box-shadow:0 2px 8px rgba(58,170,140,0.2)">💾 บันทึกความคืบหน้า</button>
+    </div>
+  </div>
+  <div class="mpwrap"><div class="mpfill" id="mpb" style="width: 1%;"></div></div>
+  <div class="mplabel"><span id="mpt">✅ 3 / 249 รายการ</span><span id="mpp">1%</span></div>
+  <div id="page-calendar" class="page active"><div class="sectitle">📅 ตารางรายวัน <span class="pill">4 มี.ค. – 5 ก.ค. 2569</span></div><div class="cal-grid" id="cg"><div class="dcard dc-pink open" id="dc0"><div class="dhdr" onclick="toggleDay(0)">
+      <div class="dbox" style="background:#f9d5e0;color:#d9638a"><span class="dn">4</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">อนุกรมพิเศษ + Operation</div><div class="dsub">พี่ขิม: อนุกรม ก.พ. ปูพื้น</div></div>
+      <div class="dprog" id="dp0" style="background:#f9d5e0;color:#d9638a">33%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds0"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">อนุกรมพิเศษ + Operation</div><div class="task"><div class="chk on" id="chk-cal-4-morning-0" onclick="toggleCal('cal-4-morning-0',0)">✓</div><span class="tlabel on" id="lbl-cal-4-morning-0">อนุกรมเลขคณิต/เรขาคณิต</span></div><div class="task"><div class="chk on" id="chk-cal-4-morning-1" onclick="toggleCal('cal-4-morning-1',0)">✓</div><span class="tlabel on" id="lbl-cal-4-morning-1">อนุกรมพิเศษ/ผสม</span></div><div class="task"><div class="chk on" id="chk-cal-4-morning-2" onclick="toggleCal('cal-4-morning-2',0)">✓</div><span class="tlabel on" id="lbl-cal-4-morning-2">การบวก ลบ คูณ หาร</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่ขิม: อนุกรม ก.พ. ปูพื้น</div><div class="task"><div class="chk" id="chk-cal-4-afternoon-0" onclick="toggleCal('cal-4-afternoon-0',0)"></div><span class="tlabel" id="lbl-cal-4-afternoon-0">ดูคลิปพี่ขิม</span></div><div class="task"><div class="chk" id="chk-cal-4-afternoon-1" onclick="toggleCal('cal-4-afternoon-1',0)"></div><span class="tlabel" id="lbl-cal-4-afternoon-1">จดสูตรและเทคนิค</span></div><div class="task"><div class="chk" id="chk-cal-4-afternoon-2" onclick="toggleCal('cal-4-afternoon-2',0)"></div><span class="tlabel" id="lbl-cal-4-afternoon-2">ทำโจทย์ตามคลิป</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">โจทย์ Operation 20 ข้อ</div><div class="task"><div class="chk" id="chk-cal-4-evening-0" onclick="toggleCal('cal-4-evening-0',0)"></div><span class="tlabel" id="lbl-cal-4-evening-0">ทำโจทย์ 20 ข้อ</span></div><div class="task"><div class="chk" id="chk-cal-4-evening-1" onclick="toggleCal('cal-4-evening-1',0)"></div><span class="tlabel" id="lbl-cal-4-evening-1">เช็คคำตอบ</span></div><div class="task"><div class="chk" id="chk-cal-4-evening-2" onclick="toggleCal('cal-4-evening-2',0)"></div><span class="tlabel" id="lbl-cal-4-evening-2">จดจุดที่ผิด</span></div></div></div></div><div class="dcard dc-mint" id="dc1"><div class="dhdr" onclick="toggleDay(1)">
+      <div class="dbox" style="background:#d4f0e8;color:#3aaa8c"><span class="dn">5</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">เลขพื้นฐาน + ห.ร.ม./ค.ร.น.</div><div class="dsub">พี่แมงปอ: เคล็ดลับมือใหม่</div></div>
+      <div class="dprog" id="dp1" style="background:#d4f0e8;color:#3aaa8c">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds1"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">เลขพื้นฐาน + ห.ร.ม./ค.ร.น.</div><div class="task"><div class="chk" id="chk-cal-5-morning-0" onclick="toggleCal('cal-5-morning-0',1)"></div><span class="tlabel" id="lbl-cal-5-morning-0">ห.ร.ม.</span></div><div class="task"><div class="chk" id="chk-cal-5-morning-1" onclick="toggleCal('cal-5-morning-1',1)"></div><span class="tlabel" id="lbl-cal-5-morning-1">ค.ร.น.</span></div><div class="task"><div class="chk" id="chk-cal-5-morning-2" onclick="toggleCal('cal-5-morning-2',1)"></div><span class="tlabel" id="lbl-cal-5-morning-2">ตัวหาร/ตัวคูณร่วม</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่แมงปอ: เคล็ดลับมือใหม่</div><div class="task"><div class="chk" id="chk-cal-5-afternoon-0" onclick="toggleCal('cal-5-afternoon-0',1)"></div><span class="tlabel" id="lbl-cal-5-afternoon-0">ดูคลิปพี่แมงปอ</span></div><div class="task"><div class="chk" id="chk-cal-5-afternoon-1" onclick="toggleCal('cal-5-afternoon-1',1)"></div><span class="tlabel" id="lbl-cal-5-afternoon-1">จดเทคนิคลัด</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">โจทย์เลขพื้นฐาน 20 ข้อ</div><div class="task"><div class="chk" id="chk-cal-5-evening-0" onclick="toggleCal('cal-5-evening-0',1)"></div><span class="tlabel" id="lbl-cal-5-evening-0">ทำโจทย์ 20 ข้อ</span></div><div class="task"><div class="chk" id="chk-cal-5-evening-1" onclick="toggleCal('cal-5-evening-1',1)"></div><span class="tlabel" id="lbl-cal-5-evening-1">จด Pic Recap</span></div></div></div></div><div class="dcard dc-lavender" id="dc2"><div class="dhdr" onclick="toggleDay(2)">
+      <div class="dbox" style="background:#e8dff5;color:#7050b0"><span class="dn">6</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">อัตราส่วน + ของผสม</div><div class="dsub">พี่ขิม: รวมข้อสอบปี 63–64</div></div>
+      <div class="dprog" id="dp2" style="background:#e8dff5;color:#7050b0">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds2"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">อัตราส่วน + ของผสม</div><div class="task"><div class="chk" id="chk-cal-6-morning-0" onclick="toggleCal('cal-6-morning-0',2)"></div><span class="tlabel" id="lbl-cal-6-morning-0">อัตราส่วนอย่างง่าย</span></div><div class="task"><div class="chk" id="chk-cal-6-morning-1" onclick="toggleCal('cal-6-morning-1',2)"></div><span class="tlabel" id="lbl-cal-6-morning-1">อัตราส่วนผสม</span></div><div class="task"><div class="chk" id="chk-cal-6-morning-2" onclick="toggleCal('cal-6-morning-2',2)"></div><span class="tlabel" id="lbl-cal-6-morning-2">การผสมสาร</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่ขิม: รวมข้อสอบปี 63–64</div><div class="task"><div class="chk" id="chk-cal-6-afternoon-0" onclick="toggleCal('cal-6-afternoon-0',2)"></div><span class="tlabel" id="lbl-cal-6-afternoon-0">ทำข้อสอบจริง 63–64</span></div><div class="task"><div class="chk" id="chk-cal-6-afternoon-1" onclick="toggleCal('cal-6-afternoon-1',2)"></div><span class="tlabel" id="lbl-cal-6-afternoon-1">เช็คเฉลยและวิเคราะห์</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">ทบทวนสูตรของผสม</div><div class="task"><div class="chk" id="chk-cal-6-evening-0" onclick="toggleCal('cal-6-evening-0',2)"></div><span class="tlabel" id="lbl-cal-6-evening-0">สรุปสูตรของผสม</span></div><div class="task"><div class="chk" id="chk-cal-6-evening-1" onclick="toggleCal('cal-6-evening-1',2)"></div><span class="tlabel" id="lbl-cal-6-evening-1">ทำโจทย์เพิ่ม 10 ข้อ</span></div></div></div></div><div class="dcard dc-peach" id="dc3"><div class="dhdr" onclick="toggleDay(3)">
+      <div class="dbox" style="background:#fde8d0;color:#d87030"><span class="dn">7</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">ร้อยละ + กำไรขาดทุน</div><div class="dsub">พี่แมงปอ: สรุปกฎหมายอาญา</div></div>
+      <div class="dprog" id="dp3" style="background:#fde8d0;color:#d87030">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds3"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">ร้อยละ + กำไรขาดทุน</div><div class="task"><div class="chk" id="chk-cal-7-morning-0" onclick="toggleCal('cal-7-morning-0',3)"></div><span class="tlabel" id="lbl-cal-7-morning-0">ร้อยละ/เปอร์เซ็นต์</span></div><div class="task"><div class="chk" id="chk-cal-7-morning-1" onclick="toggleCal('cal-7-morning-1',3)"></div><span class="tlabel" id="lbl-cal-7-morning-1">กำไร-ขาดทุน</span></div><div class="task"><div class="chk" id="chk-cal-7-morning-2" onclick="toggleCal('cal-7-morning-2',3)"></div><span class="tlabel" id="lbl-cal-7-morning-2">ส่วนลด/ราคาขาย</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่แมงปอ: สรุปกฎหมายอาญา</div><div class="task"><div class="chk" id="chk-cal-7-afternoon-0" onclick="toggleCal('cal-7-afternoon-0',3)"></div><span class="tlabel" id="lbl-cal-7-afternoon-0">ดูคลิปกฎหมายอาญา</span></div><div class="task"><div class="chk" id="chk-cal-7-afternoon-1" onclick="toggleCal('cal-7-afternoon-1',3)"></div><span class="tlabel" id="lbl-cal-7-afternoon-1">จดหลักกฎหมายสำคัญ</span></div><div class="task"><div class="chk" id="chk-cal-7-afternoon-2" onclick="toggleCal('cal-7-afternoon-2',3)"></div><span class="tlabel" id="lbl-cal-7-afternoon-2">ทำโจทย์</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">โจทย์ร้อยละ 30 ข้อ</div><div class="task"><div class="chk" id="chk-cal-7-evening-0" onclick="toggleCal('cal-7-evening-0',3)"></div><span class="tlabel" id="lbl-cal-7-evening-0">ทำโจทย์ร้อยละ 20 ข้อ</span></div><div class="task"><div class="chk" id="chk-cal-7-evening-1" onclick="toggleCal('cal-7-evening-1',3)"></div><span class="tlabel" id="lbl-cal-7-evening-1">ทำโจทย์กำไร-ขาดทุน 10 ข้อ</span></div></div></div></div><div class="dcard dc-sky" id="dc4"><div class="dhdr" onclick="toggleDay(4)">
+      <div class="dbox" style="background:#d5eaf9;color:#3a88c8"><span class="dn">8</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">ดอกเบี้ย + ร้อยละการเปลี่ยน</div><div class="dsub">พี่น้อต: สรุปกฎหมาย ภาค ก.</div></div>
+      <div class="dprog" id="dp4" style="background:#d5eaf9;color:#3a88c8">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds4"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">ดอกเบี้ย + ร้อยละการเปลี่ยน</div><div class="task"><div class="chk" id="chk-cal-8-morning-0" onclick="toggleCal('cal-8-morning-0',4)"></div><span class="tlabel" id="lbl-cal-8-morning-0">ดอกเบี้ยอย่างง่าย</span></div><div class="task"><div class="chk" id="chk-cal-8-morning-1" onclick="toggleCal('cal-8-morning-1',4)"></div><span class="tlabel" id="lbl-cal-8-morning-1">ดอกเบี้ยทบต้น</span></div><div class="task"><div class="chk" id="chk-cal-8-morning-2" onclick="toggleCal('cal-8-morning-2',4)"></div><span class="tlabel" id="lbl-cal-8-morning-2">อัตราการเปลี่ยนแปลง</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่น้อต: สรุปกฎหมาย ภาค ก.</div><div class="task"><div class="chk" id="chk-cal-8-afternoon-0" onclick="toggleCal('cal-8-afternoon-0',4)"></div><span class="tlabel" id="lbl-cal-8-afternoon-0">ดูคลิปพี่น้อต</span></div><div class="task"><div class="chk" id="chk-cal-8-afternoon-1" onclick="toggleCal('cal-8-afternoon-1',4)"></div><span class="tlabel" id="lbl-cal-8-afternoon-1">สรุปกฎหมายภาค ก.</span></div><div class="task"><div class="chk" id="chk-cal-8-afternoon-2" onclick="toggleCal('cal-8-afternoon-2',4)"></div><span class="tlabel" id="lbl-cal-8-afternoon-2">จด Mind Map</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">สรุป Week 1</div><div class="task"><div class="chk" id="chk-cal-8-evening-0" onclick="toggleCal('cal-8-evening-0',4)"></div><span class="tlabel" id="lbl-cal-8-evening-0">ทบทวนคณิต Week 1</span></div><div class="task"><div class="chk" id="chk-cal-8-evening-1" onclick="toggleCal('cal-8-evening-1',4)"></div><span class="tlabel" id="lbl-cal-8-evening-1">ทบทวนกฎหมาย Week 1</span></div><div class="task"><div class="chk" id="chk-cal-8-evening-2" onclick="toggleCal('cal-8-evening-2',4)"></div><span class="tlabel" id="lbl-cal-8-evening-2">จด Pic Recap</span></div></div></div></div><div class="dcard dc-yellow" id="dc5"><div class="dhdr" onclick="toggleDay(5)">
+      <div class="dbox" style="background:#fff8d0;color:#b89a10"><span class="dn">9</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">สมการ 1 + 2 ตัวแปร</div><div class="dsub">พี่ขิม: พื้นฐานคณิตเปลี่ยนชีวิต</div></div>
+      <div class="dprog" id="dp5" style="background:#fff8d0;color:#b89a10">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds5"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">สมการ 1 + 2 ตัวแปร</div><div class="task"><div class="chk" id="chk-cal-9-morning-0" onclick="toggleCal('cal-9-morning-0',5)"></div><span class="tlabel" id="lbl-cal-9-morning-0">สมการเชิงเส้น 1 ตัวแปร</span></div><div class="task"><div class="chk" id="chk-cal-9-morning-1" onclick="toggleCal('cal-9-morning-1',5)"></div><span class="tlabel" id="lbl-cal-9-morning-1">สมการ 2 ตัวแปร</span></div><div class="task"><div class="chk" id="chk-cal-9-morning-2" onclick="toggleCal('cal-9-morning-2',5)"></div><span class="tlabel" id="lbl-cal-9-morning-2">โจทย์อายุ/งาน/อัตราเร็ว</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่ขิม: พื้นฐานคณิตเปลี่ยนชีวิต</div><div class="task"><div class="chk" id="chk-cal-9-afternoon-0" onclick="toggleCal('cal-9-afternoon-0',5)"></div><span class="tlabel" id="lbl-cal-9-afternoon-0">ดูคลิปพี่ขิม</span></div><div class="task"><div class="chk" id="chk-cal-9-afternoon-1" onclick="toggleCal('cal-9-afternoon-1',5)"></div><span class="tlabel" id="lbl-cal-9-afternoon-1">จดเทคนิคสำคัญ</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">โจทย์สมการ 20 ข้อ</div><div class="task"><div class="chk" id="chk-cal-9-evening-0" onclick="toggleCal('cal-9-evening-0',5)"></div><span class="tlabel" id="lbl-cal-9-evening-0">ทำโจทย์สมการ 20 ข้อ</span></div><div class="task"><div class="chk" id="chk-cal-9-evening-1" onclick="toggleCal('cal-9-evening-1',5)"></div><span class="tlabel" id="lbl-cal-9-evening-1">เน้นโจทย์อายุ 10 ข้อ</span></div></div></div></div><div class="dcard dc-pink" id="dc6"><div class="dhdr" onclick="toggleDay(6)">
+      <div class="dbox" style="background:#f9d5e0;color:#d9638a"><span class="dn">10</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">พื้นที่และปริมาตร</div><div class="dsub">พี่ขิม: เฉลยข้อสอบ ก.พ. 66</div></div>
+      <div class="dprog" id="dp6" style="background:#f9d5e0;color:#d9638a">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds6"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">พื้นที่และปริมาตร</div><div class="task"><div class="chk" id="chk-cal-10-morning-0" onclick="toggleCal('cal-10-morning-0',6)"></div><span class="tlabel" id="lbl-cal-10-morning-0">พื้นที่รูปทรง 2 มิติ</span></div><div class="task"><div class="chk" id="chk-cal-10-morning-1" onclick="toggleCal('cal-10-morning-1',6)"></div><span class="tlabel" id="lbl-cal-10-morning-1">ปริมาตรรูปทรง 3 มิติ</span></div><div class="task"><div class="chk" id="chk-cal-10-morning-2" onclick="toggleCal('cal-10-morning-2',6)"></div><span class="tlabel" id="lbl-cal-10-morning-2">พื้นที่ผิว</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่ขิม: เฉลยข้อสอบ ก.พ. 66</div><div class="task"><div class="chk" id="chk-cal-10-afternoon-0" onclick="toggleCal('cal-10-afternoon-0',6)"></div><span class="tlabel" id="lbl-cal-10-afternoon-0">ดูเฉลยข้อสอบจริง</span></div><div class="task"><div class="chk" id="chk-cal-10-afternoon-1" onclick="toggleCal('cal-10-afternoon-1',6)"></div><span class="tlabel" id="lbl-cal-10-afternoon-1">วิเคราะห์จุดอ่อน</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">โจทย์พื้นที่/ปริมาตร</div><div class="task"><div class="chk" id="chk-cal-10-evening-0" onclick="toggleCal('cal-10-evening-0',6)"></div><span class="tlabel" id="lbl-cal-10-evening-0">ทำโจทย์พื้นที่ 15 ข้อ</span></div><div class="task"><div class="chk" id="chk-cal-10-evening-1" onclick="toggleCal('cal-10-evening-1',6)"></div><span class="tlabel" id="lbl-cal-10-evening-1">ทำโจทย์ปริมาตร 10 ข้อ</span></div></div></div></div><div class="dcard dc-mint" id="dc7"><div class="dhdr" onclick="toggleDay(7)">
+      <div class="dbox" style="background:#d4f0e8;color:#3aaa8c"><span class="dn">11</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">สถิติ: Mean / Median / Mode</div><div class="dsub">พี่ขิม: สูตรลับคณิตราชการ</div></div>
+      <div class="dprog" id="dp7" style="background:#d4f0e8;color:#3aaa8c">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds7"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">สถิติ: Mean / Median / Mode</div><div class="task"><div class="chk" id="chk-cal-11-morning-0" onclick="toggleCal('cal-11-morning-0',7)"></div><span class="tlabel" id="lbl-cal-11-morning-0">Mean / Median / Mode</span></div><div class="task"><div class="chk" id="chk-cal-11-morning-1" onclick="toggleCal('cal-11-morning-1',7)"></div><span class="tlabel" id="lbl-cal-11-morning-1">การกระจาย/ส่วนเบี่ยงเบน</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่ขิม: สูตรลับคณิตราชการ</div><div class="task"><div class="chk" id="chk-cal-11-afternoon-0" onclick="toggleCal('cal-11-afternoon-0',7)"></div><span class="tlabel" id="lbl-cal-11-afternoon-0">ดูคลิปสูตรลับ</span></div><div class="task"><div class="chk" id="chk-cal-11-afternoon-1" onclick="toggleCal('cal-11-afternoon-1',7)"></div><span class="tlabel" id="lbl-cal-11-afternoon-1">จดสูตรทั้งหมด</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">โจทย์สถิติ 20 ข้อ</div><div class="task"><div class="chk" id="chk-cal-11-evening-0" onclick="toggleCal('cal-11-evening-0',7)"></div><span class="tlabel" id="lbl-cal-11-evening-0">ทำโจทย์สถิติ 20 ข้อ</span></div></div></div></div><div class="dcard dc-lavender" id="dc8"><div class="dhdr" onclick="toggleDay(8)">
+      <div class="dbox" style="background:#e8dff5;color:#7050b0"><span class="dn">12</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">ตารางข้อมูล + กราฟ</div><div class="dsub">พี่ขิม: ติววิเคราะห์ตาราง</div></div>
+      <div class="dprog" id="dp8" style="background:#e8dff5;color:#7050b0">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds8"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">ตารางข้อมูล + กราฟ</div><div class="task"><div class="chk" id="chk-cal-12-morning-0" onclick="toggleCal('cal-12-morning-0',8)"></div><span class="tlabel" id="lbl-cal-12-morning-0">อ่านตารางข้อมูล</span></div><div class="task"><div class="chk" id="chk-cal-12-morning-1" onclick="toggleCal('cal-12-morning-1',8)"></div><span class="tlabel" id="lbl-cal-12-morning-1">วิเคราะห์กราฟ</span></div><div class="task"><div class="chk" id="chk-cal-12-morning-2" onclick="toggleCal('cal-12-morning-2',8)"></div><span class="tlabel" id="lbl-cal-12-morning-2">เปรียบเทียบข้อมูล</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่ขิม: ติววิเคราะห์ตาราง</div><div class="task"><div class="chk" id="chk-cal-12-afternoon-0" onclick="toggleCal('cal-12-afternoon-0',8)"></div><span class="tlabel" id="lbl-cal-12-afternoon-0">ดูคลิปวิเคราะห์ตาราง</span></div><div class="task"><div class="chk" id="chk-cal-12-afternoon-1" onclick="toggleCal('cal-12-afternoon-1',8)"></div><span class="tlabel" id="lbl-cal-12-afternoon-1">ทำโจทย์ตามคลิป</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">โจทย์ตาราง 20 ข้อ</div><div class="task"><div class="chk" id="chk-cal-12-evening-0" onclick="toggleCal('cal-12-evening-0',8)"></div><span class="tlabel" id="lbl-cal-12-evening-0">ทำโจทย์ตาราง 20 ข้อ</span></div><div class="task"><div class="chk" id="chk-cal-12-evening-1" onclick="toggleCal('cal-12-evening-1',8)"></div><span class="tlabel" id="lbl-cal-12-evening-1">ฝึกจับเวลา</span></div></div></div></div><div class="dcard dc-peach" id="dc9"><div class="dhdr" onclick="toggleDay(9)">
+      <div class="dbox" style="background:#fde8d0;color:#d87030"><span class="dn">13</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">พิมพ์บัตรสอบ + เงื่อนไขสัญลักษณ์</div><div class="dsub">พี่แมงปอ: วาร์ป 200 ข้อ</div></div>
+      <div class="dprog" id="dp9" style="background:#fde8d0;color:#d87030">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds9"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">พิมพ์บัตรสอบ + เงื่อนไขสัญลักษณ์</div><div class="task"><div class="chk" id="chk-cal-13-morning-0" onclick="toggleCal('cal-13-morning-0',9)"></div><span class="tlabel" id="lbl-cal-13-morning-0">พิมพ์บัตรสอบ ✅</span></div><div class="task"><div class="chk" id="chk-cal-13-morning-1" onclick="toggleCal('cal-13-morning-1',9)"></div><span class="tlabel" id="lbl-cal-13-morning-1">เงื่อนไขสัญลักษณ์พื้นฐาน</span></div><div class="task"><div class="chk" id="chk-cal-13-morning-2" onclick="toggleCal('cal-13-morning-2',9)"></div><span class="tlabel" id="lbl-cal-13-morning-2">เงื่อนไขผสม</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่แมงปอ: วาร์ป 200 ข้อ</div><div class="task"><div class="chk" id="chk-cal-13-afternoon-0" onclick="toggleCal('cal-13-afternoon-0',9)"></div><span class="tlabel" id="lbl-cal-13-afternoon-0">ทำข้อสอบ 200 ข้อ ส่วนที่ 1</span></div><div class="task"><div class="chk" id="chk-cal-13-afternoon-1" onclick="toggleCal('cal-13-afternoon-1',9)"></div><span class="tlabel" id="lbl-cal-13-afternoon-1">จดข้อที่ผิด</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">โจทย์เงื่อนไขสัญลักษณ์</div><div class="task"><div class="chk" id="chk-cal-13-evening-0" onclick="toggleCal('cal-13-evening-0',9)"></div><span class="tlabel" id="lbl-cal-13-evening-0">ทำโจทย์ 20 ข้อ</span></div><div class="task"><div class="chk" id="chk-cal-13-evening-1" onclick="toggleCal('cal-13-evening-1',9)"></div><span class="tlabel" id="lbl-cal-13-evening-1">ทบทวนจุดที่ผิด</span></div></div></div></div><div class="dcard dc-sky" id="dc10"><div class="dhdr" onclick="toggleDay(10)">
+      <div class="dbox" style="background:#d5eaf9;color:#3a88c8"><span class="dn">14</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">เงื่อนไขสัญลักษณ์ (ยาก)</div><div class="dsub">พี่แมงปอ: 30 ผลึกอังกฤษ (1-10)</div></div>
+      <div class="dprog" id="dp10" style="background:#d5eaf9;color:#3a88c8">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds10"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">เงื่อนไขสัญลักษณ์ (ยาก)</div><div class="task"><div class="chk" id="chk-cal-14-morning-0" onclick="toggleCal('cal-14-morning-0',10)"></div><span class="tlabel" id="lbl-cal-14-morning-0">เงื่อนไขซับซ้อน</span></div><div class="task"><div class="chk" id="chk-cal-14-morning-1" onclick="toggleCal('cal-14-morning-1',10)"></div><span class="tlabel" id="lbl-cal-14-morning-1">โจทย์ระดับยาก</span></div><div class="task"><div class="chk" id="chk-cal-14-morning-2" onclick="toggleCal('cal-14-morning-2',10)"></div><span class="tlabel" id="lbl-cal-14-morning-2">เทคนิคแก้โจทย์เร็ว</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่แมงปอ: 30 ผลึกอังกฤษ (1-10)</div><div class="task"><div class="chk" id="chk-cal-14-afternoon-0" onclick="toggleCal('cal-14-afternoon-0',10)"></div><span class="tlabel" id="lbl-cal-14-afternoon-0">ศัพท์ผลึก 1-10</span></div><div class="task"><div class="chk" id="chk-cal-14-afternoon-1" onclick="toggleCal('cal-14-afternoon-1',10)"></div><span class="tlabel" id="lbl-cal-14-afternoon-1">จำ Vocab 10 คำ</span></div><div class="task"><div class="chk" id="chk-cal-14-afternoon-2" onclick="toggleCal('cal-14-afternoon-2',10)"></div><span class="tlabel" id="lbl-cal-14-afternoon-2">ทำแบบฝึกหัด</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">ทวนศัพท์อังกฤษ</div><div class="task"><div class="chk" id="chk-cal-14-evening-0" onclick="toggleCal('cal-14-evening-0',10)"></div><span class="tlabel" id="lbl-cal-14-evening-0">ทบทวน Vocab วันนี้</span></div><div class="task"><div class="chk" id="chk-cal-14-evening-1" onclick="toggleCal('cal-14-evening-1',10)"></div><span class="tlabel" id="lbl-cal-14-evening-1">ฝึกใช้ศัพท์ในประโยค</span></div></div></div></div><div class="dcard dc-yellow" id="dc11"><div class="dhdr" onclick="toggleDay(11)">
+      <div class="dbox" style="background:#fff8d0;color:#b89a10"><span class="dn">15</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">เงื่อนไขภาษา</div><div class="dsub">พี่ขิม: เงื่อนไขภาษา (ข้อสอบจริง)</div></div>
+      <div class="dprog" id="dp11" style="background:#fff8d0;color:#b89a10">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds11"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">เงื่อนไขภาษา</div><div class="task"><div class="chk" id="chk-cal-15-morning-0" onclick="toggleCal('cal-15-morning-0',11)"></div><span class="tlabel" id="lbl-cal-15-morning-0">เงื่อนไขภาษาพื้นฐาน</span></div><div class="task"><div class="chk" id="chk-cal-15-morning-1" onclick="toggleCal('cal-15-morning-1',11)"></div><span class="tlabel" id="lbl-cal-15-morning-1">การตีความเงื่อนไข</span></div><div class="task"><div class="chk" id="chk-cal-15-morning-2" onclick="toggleCal('cal-15-morning-2',11)"></div><span class="tlabel" id="lbl-cal-15-morning-2">โจทย์จากข้อสอบจริง</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่ขิม: เงื่อนไขภาษา (ข้อสอบจริง)</div><div class="task"><div class="chk" id="chk-cal-15-afternoon-0" onclick="toggleCal('cal-15-afternoon-0',11)"></div><span class="tlabel" id="lbl-cal-15-afternoon-0">ดูคลิปเงื่อนไขภาษา</span></div><div class="task"><div class="chk" id="chk-cal-15-afternoon-1" onclick="toggleCal('cal-15-afternoon-1',11)"></div><span class="tlabel" id="lbl-cal-15-afternoon-1">ทำโจทย์ข้อสอบจริง</span></div><div class="task"><div class="chk" id="chk-cal-15-afternoon-2" onclick="toggleCal('cal-15-afternoon-2',11)"></div><span class="tlabel" id="lbl-cal-15-afternoon-2">วิเคราะห์เฉลย</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">โจทย์เงื่อนไขภาษา 20 ข้อ</div><div class="task"><div class="chk" id="chk-cal-15-evening-0" onclick="toggleCal('cal-15-evening-0',11)"></div><span class="tlabel" id="lbl-cal-15-evening-0">ทำโจทย์ 20 ข้อ</span></div><div class="task"><div class="chk" id="chk-cal-15-evening-1" onclick="toggleCal('cal-15-evening-1',11)"></div><span class="tlabel" id="lbl-cal-15-evening-1">ฝึกจับเวลา</span></div></div></div></div><div class="dcard dc-pink" id="dc12"><div class="dhdr" onclick="toggleDay(12)">
+      <div class="dbox" style="background:#f9d5e0;color:#d9638a"><span class="dn">16</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">อุปมาอุปไมย (บทที่ 30–31)</div><div class="dsub">พี่ขิม: ติวอุปมาอุปไมย</div></div>
+      <div class="dprog" id="dp12" style="background:#f9d5e0;color:#d9638a">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds12"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">อุปมาอุปไมย (บทที่ 30–31)</div><div class="task"><div class="chk" id="chk-cal-16-morning-0" onclick="toggleCal('cal-16-morning-0',12)"></div><span class="tlabel" id="lbl-cal-16-morning-0">ความสัมพันธ์ของคำ</span></div><div class="task"><div class="chk" id="chk-cal-16-morning-1" onclick="toggleCal('cal-16-morning-1',12)"></div><span class="tlabel" id="lbl-cal-16-morning-1">อุปมาอุปไมยประเภทต่างๆ</span></div><div class="task"><div class="chk" id="chk-cal-16-morning-2" onclick="toggleCal('cal-16-morning-2',12)"></div><span class="tlabel" id="lbl-cal-16-morning-2">โจทย์บทที่ 30-31</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่ขิม: ติวอุปมาอุปไมย</div><div class="task"><div class="chk" id="chk-cal-16-afternoon-0" onclick="toggleCal('cal-16-afternoon-0',12)"></div><span class="tlabel" id="lbl-cal-16-afternoon-0">ดูคลิปพี่ขิม</span></div><div class="task"><div class="chk" id="chk-cal-16-afternoon-1" onclick="toggleCal('cal-16-afternoon-1',12)"></div><span class="tlabel" id="lbl-cal-16-afternoon-1">จดเทคนิค</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">โจทย์อุปมาอุปไมย 20 ข้อ</div><div class="task"><div class="chk" id="chk-cal-16-evening-0" onclick="toggleCal('cal-16-evening-0',12)"></div><span class="tlabel" id="lbl-cal-16-evening-0">ทำโจทย์ 20 ข้อ</span></div></div></div></div><div class="dcard dc-mint" id="dc13"><div class="dhdr" onclick="toggleDay(13)">
+      <div class="dbox" style="background:#d4f0e8;color:#3aaa8c"><span class="dn">17</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">อุปมาอุปไมย (บทที่ 32–33)</div><div class="dsub">พี่น้อต: ติวภาษาไทย ภาค ก.</div></div>
+      <div class="dprog" id="dp13" style="background:#d4f0e8;color:#3aaa8c">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds13"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">อุปมาอุปไมย (บทที่ 32–33)</div><div class="task"><div class="chk" id="chk-cal-17-morning-0" onclick="toggleCal('cal-17-morning-0',13)"></div><span class="tlabel" id="lbl-cal-17-morning-0">โจทย์บทที่ 32-33</span></div><div class="task"><div class="chk" id="chk-cal-17-morning-1" onclick="toggleCal('cal-17-morning-1',13)"></div><span class="tlabel" id="lbl-cal-17-morning-1">โจทย์ระดับยาก</span></div><div class="task"><div class="chk" id="chk-cal-17-morning-2" onclick="toggleCal('cal-17-morning-2',13)"></div><span class="tlabel" id="lbl-cal-17-morning-2">ทบทวนรูปแบบที่ออกสอบ</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่น้อต: ติวภาษาไทย ภาค ก.</div><div class="task"><div class="chk" id="chk-cal-17-afternoon-0" onclick="toggleCal('cal-17-afternoon-0',13)"></div><span class="tlabel" id="lbl-cal-17-afternoon-0">ดูคลิปพี่น้อต</span></div><div class="task"><div class="chk" id="chk-cal-17-afternoon-1" onclick="toggleCal('cal-17-afternoon-1',13)"></div><span class="tlabel" id="lbl-cal-17-afternoon-1">จดเทคนิค</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">ฝึกคู่คำไทย 20 คู่</div><div class="task"><div class="chk" id="chk-cal-17-evening-0" onclick="toggleCal('cal-17-evening-0',13)"></div><span class="tlabel" id="lbl-cal-17-evening-0">ท่องคู่คำไทย 20 คู่</span></div><div class="task"><div class="chk" id="chk-cal-17-evening-1" onclick="toggleCal('cal-17-evening-1',13)"></div><span class="tlabel" id="lbl-cal-17-evening-1">ทำโจทย์คู่คำ</span></div></div></div></div><div class="dcard dc-lavender" id="dc14"><div class="dhdr" onclick="toggleDay(14)">
+      <div class="dbox" style="background:#e8dff5;color:#7050b0"><span class="dn">18</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">การเรียงประโยค (บทที่ 34–35)</div><div class="dsub">พี่ขิม: การเรียงประโยค ก.พ.</div></div>
+      <div class="dprog" id="dp14" style="background:#e8dff5;color:#7050b0">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds14"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">การเรียงประโยค (บทที่ 34–35)</div><div class="task"><div class="chk" id="chk-cal-18-morning-0" onclick="toggleCal('cal-18-morning-0',14)"></div><span class="tlabel" id="lbl-cal-18-morning-0">หลักการเรียงประโยค</span></div><div class="task"><div class="chk" id="chk-cal-18-morning-1" onclick="toggleCal('cal-18-morning-1',14)"></div><span class="tlabel" id="lbl-cal-18-morning-1">ประโยคเชื่อม/ลำดับเหตุการณ์</span></div><div class="task"><div class="chk" id="chk-cal-18-morning-2" onclick="toggleCal('cal-18-morning-2',14)"></div><span class="tlabel" id="lbl-cal-18-morning-2">โจทย์บทที่ 34-35</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่ขิม: การเรียงประโยค ก.พ.</div><div class="task"><div class="chk" id="chk-cal-18-afternoon-0" onclick="toggleCal('cal-18-afternoon-0',14)"></div><span class="tlabel" id="lbl-cal-18-afternoon-0">ดูคลิปพี่ขิม</span></div><div class="task"><div class="chk" id="chk-cal-18-afternoon-1" onclick="toggleCal('cal-18-afternoon-1',14)"></div><span class="tlabel" id="lbl-cal-18-afternoon-1">ทำโจทย์ตามคลิป</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">โจทย์เรียงประโยค 20 ข้อ</div><div class="task"><div class="chk" id="chk-cal-18-evening-0" onclick="toggleCal('cal-18-evening-0',14)"></div><span class="tlabel" id="lbl-cal-18-evening-0">ทำโจทย์ 20 ข้อ</span></div><div class="task"><div class="chk" id="chk-cal-18-evening-1" onclick="toggleCal('cal-18-evening-1',14)"></div><span class="tlabel" id="lbl-cal-18-evening-1">ฝึกจับเวลา</span></div></div></div></div><div class="dcard dc-peach" id="dc15"><div class="dhdr" onclick="toggleDay(15)">
+      <div class="dbox" style="background:#fde8d0;color:#d87030"><span class="dn">19</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">บทความสั้น/ยาว (บทที่ 36–37)</div><div class="dsub">พี่ขิม: ตีความบทความ (คลิปแดง)</div></div>
+      <div class="dprog" id="dp15" style="background:#fde8d0;color:#d87030">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds15"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">บทความสั้น/ยาว (บทที่ 36–37)</div><div class="task"><div class="chk" id="chk-cal-19-morning-0" onclick="toggleCal('cal-19-morning-0',15)"></div><span class="tlabel" id="lbl-cal-19-morning-0">เทคนิคอ่านบทความเร็ว</span></div><div class="task"><div class="chk" id="chk-cal-19-morning-1" onclick="toggleCal('cal-19-morning-1',15)"></div><span class="tlabel" id="lbl-cal-19-morning-1">จับใจความสำคัญ</span></div><div class="task"><div class="chk" id="chk-cal-19-morning-2" onclick="toggleCal('cal-19-morning-2',15)"></div><span class="tlabel" id="lbl-cal-19-morning-2">โจทย์บทที่ 36-37</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่ขิม: ตีความบทความ (คลิปแดง)</div><div class="task"><div class="chk" id="chk-cal-19-afternoon-0" onclick="toggleCal('cal-19-afternoon-0',15)"></div><span class="tlabel" id="lbl-cal-19-afternoon-0">ดูคลิปแดงพี่ขิม</span></div><div class="task"><div class="chk" id="chk-cal-19-afternoon-1" onclick="toggleCal('cal-19-afternoon-1',15)"></div><span class="tlabel" id="lbl-cal-19-afternoon-1">จดเทคนิคตีความ</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">ฝึกอ่านบทความ 3 เรื่อง</div><div class="task"><div class="chk" id="chk-cal-19-evening-0" onclick="toggleCal('cal-19-evening-0',15)"></div><span class="tlabel" id="lbl-cal-19-evening-0">อ่านบทความ 3 เรื่อง</span></div><div class="task"><div class="chk" id="chk-cal-19-evening-1" onclick="toggleCal('cal-19-evening-1',15)"></div><span class="tlabel" id="lbl-cal-19-evening-1">ทำโจทย์ตีความ</span></div></div></div></div><div class="dcard dc-sky" id="dc16"><div class="dhdr" onclick="toggleDay(16)">
+      <div class="dbox" style="background:#d5eaf9;color:#3a88c8"><span class="dn">20</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">บทความสถิติ (บทที่ 38–39)</div><div class="dsub">พี่แมงปอ: 30 ผลึกอังกฤษ (11-20)</div></div>
+      <div class="dprog" id="dp16" style="background:#d5eaf9;color:#3a88c8">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds16"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">บทความสถิติ (บทที่ 38–39)</div><div class="task"><div class="chk" id="chk-cal-20-morning-0" onclick="toggleCal('cal-20-morning-0',16)"></div><span class="tlabel" id="lbl-cal-20-morning-0">อ่านบทความที่มีตาราง/กราฟ</span></div><div class="task"><div class="chk" id="chk-cal-20-morning-1" onclick="toggleCal('cal-20-morning-1',16)"></div><span class="tlabel" id="lbl-cal-20-morning-1">วิเคราะห์ข้อมูลเชิงสถิติ</span></div><div class="task"><div class="chk" id="chk-cal-20-morning-2" onclick="toggleCal('cal-20-morning-2',16)"></div><span class="tlabel" id="lbl-cal-20-morning-2">โจทย์บทที่ 38-39</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่แมงปอ: 30 ผลึกอังกฤษ (11-20)</div><div class="task"><div class="chk" id="chk-cal-20-afternoon-0" onclick="toggleCal('cal-20-afternoon-0',16)"></div><span class="tlabel" id="lbl-cal-20-afternoon-0">ศัพท์ผลึก 11-20</span></div><div class="task"><div class="chk" id="chk-cal-20-afternoon-1" onclick="toggleCal('cal-20-afternoon-1',16)"></div><span class="tlabel" id="lbl-cal-20-afternoon-1">จำ Vocab 10 คำ</span></div><div class="task"><div class="chk" id="chk-cal-20-afternoon-2" onclick="toggleCal('cal-20-afternoon-2',16)"></div><span class="tlabel" id="lbl-cal-20-afternoon-2">ทำแบบฝึกหัด</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">โจทย์ Reading 15 ข้อ</div><div class="task"><div class="chk" id="chk-cal-20-evening-0" onclick="toggleCal('cal-20-evening-0',16)"></div><span class="tlabel" id="lbl-cal-20-evening-0">ทำโจทย์ Reading 15 ข้อ</span></div><div class="task"><div class="chk" id="chk-cal-20-evening-1" onclick="toggleCal('cal-20-evening-1',16)"></div><span class="tlabel" id="lbl-cal-20-evening-1">ทบทวน Vocab</span></div></div></div></div><div class="dcard dc-yellow" id="dc17"><div class="dhdr" onclick="toggleDay(17)">
+      <div class="dbox" style="background:#fff8d0;color:#b89a10"><span class="dn">21</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">ภาษาอังกฤษ Grammar (บทที่ 40)</div><div class="dsub">พี่แมงปอ: 30 ผลึกอังกฤษ (21-30)</div></div>
+      <div class="dprog" id="dp17" style="background:#fff8d0;color:#b89a10">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds17"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">ภาษาอังกฤษ Grammar (บทที่ 40)</div><div class="task"><div class="chk" id="chk-cal-21-morning-0" onclick="toggleCal('cal-21-morning-0',17)"></div><span class="tlabel" id="lbl-cal-21-morning-0">Tense ต่างๆ</span></div><div class="task"><div class="chk" id="chk-cal-21-morning-1" onclick="toggleCal('cal-21-morning-1',17)"></div><span class="tlabel" id="lbl-cal-21-morning-1">Subject-Verb Agreement</span></div><div class="task"><div class="chk" id="chk-cal-21-morning-2" onclick="toggleCal('cal-21-morning-2',17)"></div><span class="tlabel" id="lbl-cal-21-morning-2">Conjunctions/Prepositions</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่แมงปอ: 30 ผลึกอังกฤษ (21-30)</div><div class="task"><div class="chk" id="chk-cal-21-afternoon-0" onclick="toggleCal('cal-21-afternoon-0',17)"></div><span class="tlabel" id="lbl-cal-21-afternoon-0">ศัพท์ผลึก 21-30</span></div><div class="task"><div class="chk" id="chk-cal-21-afternoon-1" onclick="toggleCal('cal-21-afternoon-1',17)"></div><span class="tlabel" id="lbl-cal-21-afternoon-1">จำ Vocab 10 คำ</span></div><div class="task"><div class="chk" id="chk-cal-21-afternoon-2" onclick="toggleCal('cal-21-afternoon-2',17)"></div><span class="tlabel" id="lbl-cal-21-afternoon-2">ทำแบบฝึกหัด</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">โจทย์ Grammar 20 ข้อ</div><div class="task"><div class="chk" id="chk-cal-21-evening-0" onclick="toggleCal('cal-21-evening-0',17)"></div><span class="tlabel" id="lbl-cal-21-evening-0">ทำโจทย์ Grammar 20 ข้อ</span></div></div></div></div><div class="dcard dc-pink" id="dc18"><div class="dhdr" onclick="toggleDay(18)">
+      <div class="dbox" style="background:#f9d5e0;color:#d9638a"><span class="dn">22</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">ภาษาอังกฤษ Conversation (41-42)</div><div class="dsub">พี่ขิม: ติวภาษาอังกฤษ</div></div>
+      <div class="dprog" id="dp18" style="background:#f9d5e0;color:#d9638a">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds18"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">ภาษาอังกฤษ Conversation (41-42)</div><div class="task"><div class="chk" id="chk-cal-22-morning-0" onclick="toggleCal('cal-22-morning-0',18)"></div><span class="tlabel" id="lbl-cal-22-morning-0">บทสนทนาสถานการณ์ต่างๆ</span></div><div class="task"><div class="chk" id="chk-cal-22-morning-1" onclick="toggleCal('cal-22-morning-1',18)"></div><span class="tlabel" id="lbl-cal-22-morning-1">Idioms/Fixed expressions</span></div><div class="task"><div class="chk" id="chk-cal-22-morning-2" onclick="toggleCal('cal-22-morning-2',18)"></div><span class="tlabel" id="lbl-cal-22-morning-2">โจทย์บทที่ 41-42</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่ขิม: ติวภาษาอังกฤษ</div><div class="task"><div class="chk" id="chk-cal-22-afternoon-0" onclick="toggleCal('cal-22-afternoon-0',18)"></div><span class="tlabel" id="lbl-cal-22-afternoon-0">ดูคลิปพี่ขิม</span></div><div class="task"><div class="chk" id="chk-cal-22-afternoon-1" onclick="toggleCal('cal-22-afternoon-1',18)"></div><span class="tlabel" id="lbl-cal-22-afternoon-1">จดเทคนิค</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">ฝึกบทสนทนา 10 บท</div><div class="task"><div class="chk" id="chk-cal-22-evening-0" onclick="toggleCal('cal-22-evening-0',18)"></div><span class="tlabel" id="lbl-cal-22-evening-0">ฝึกบทสนทนา 10 บท</span></div><div class="task"><div class="chk" id="chk-cal-22-evening-1" onclick="toggleCal('cal-22-evening-1',18)"></div><span class="tlabel" id="lbl-cal-22-evening-1">ทำโจทย์ Conversation</span></div></div></div></div><div class="dcard dc-mint" id="dc19"><div class="dhdr" onclick="toggleDay(19)">
+      <div class="dbox" style="background:#d4f0e8;color:#3aaa8c"><span class="dn">23</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">กฎหมายบริหารราชการแผ่นดิน</div><div class="dsub">พี่แมงปอ: 200 ข้อ บริหารราชการ</div></div>
+      <div class="dprog" id="dp19" style="background:#d4f0e8;color:#3aaa8c">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds19"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">กฎหมายบริหารราชการแผ่นดิน</div><div class="task"><div class="chk" id="chk-cal-23-morning-0" onclick="toggleCal('cal-23-morning-0',19)"></div><span class="tlabel" id="lbl-cal-23-morning-0">ราชการส่วนกลาง/ภูมิภาค/ท้องถิ่น</span></div><div class="task"><div class="chk" id="chk-cal-23-morning-1" onclick="toggleCal('cal-23-morning-1',19)"></div><span class="tlabel" id="lbl-cal-23-morning-1">พ.ร.บ. ระเบียบบริหารราชการแผ่นดิน</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่แมงปอ: 200 ข้อ บริหารราชการ</div><div class="task"><div class="chk" id="chk-cal-23-afternoon-0" onclick="toggleCal('cal-23-afternoon-0',19)"></div><span class="tlabel" id="lbl-cal-23-afternoon-0">ทำ 200 ข้อ บริหารราชการ</span></div><div class="task"><div class="chk" id="chk-cal-23-afternoon-1" onclick="toggleCal('cal-23-afternoon-1',19)"></div><span class="tlabel" id="lbl-cal-23-afternoon-1">จดข้อที่ผิด</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">สรุปแผนผังโครงสร้าง</div><div class="task"><div class="chk" id="chk-cal-23-evening-0" onclick="toggleCal('cal-23-evening-0',19)"></div><span class="tlabel" id="lbl-cal-23-evening-0">วาด Mind Map โครงสร้าง</span></div><div class="task"><div class="chk" id="chk-cal-23-evening-1" onclick="toggleCal('cal-23-evening-1',19)"></div><span class="tlabel" id="lbl-cal-23-evening-1">ทบทวนจุดสำคัญ</span></div></div></div></div><div class="dcard dc-lavender" id="dc20"><div class="dhdr" onclick="toggleDay(20)">
+      <div class="dbox" style="background:#e8dff5;color:#7050b0"><span class="dn">24</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">กฎหมายปกครอง + ละเมิด</div><div class="dsub">พี่แมงปอ: 200 ข้อ ปกครอง/ละเมิด</div></div>
+      <div class="dprog" id="dp20" style="background:#e8dff5;color:#7050b0">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds20"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">กฎหมายปกครอง + ละเมิด</div><div class="task"><div class="chk" id="chk-cal-24-morning-0" onclick="toggleCal('cal-24-morning-0',20)"></div><span class="tlabel" id="lbl-cal-24-morning-0">หลักกฎหมายปกครอง</span></div><div class="task"><div class="chk" id="chk-cal-24-morning-1" onclick="toggleCal('cal-24-morning-1',20)"></div><span class="tlabel" id="lbl-cal-24-morning-1">ความรับผิดทางละเมิด</span></div><div class="task"><div class="chk" id="chk-cal-24-morning-2" onclick="toggleCal('cal-24-morning-2',20)"></div><span class="tlabel" id="lbl-cal-24-morning-2">คดีปกครอง</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่แมงปอ: 200 ข้อ ปกครอง/ละเมิด</div><div class="task"><div class="chk" id="chk-cal-24-afternoon-0" onclick="toggleCal('cal-24-afternoon-0',20)"></div><span class="tlabel" id="lbl-cal-24-afternoon-0">ทำ 200 ข้อ ปกครอง/ละเมิด</span></div><div class="task"><div class="chk" id="chk-cal-24-afternoon-1" onclick="toggleCal('cal-24-afternoon-1',20)"></div><span class="tlabel" id="lbl-cal-24-afternoon-1">จดข้อที่ผิด</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">สรุปเรื่องอุทธรณ์</div><div class="task"><div class="chk" id="chk-cal-24-evening-0" onclick="toggleCal('cal-24-evening-0',20)"></div><span class="tlabel" id="lbl-cal-24-evening-0">สรุปขั้นตอนอุทธรณ์</span></div><div class="task"><div class="chk" id="chk-cal-24-evening-1" onclick="toggleCal('cal-24-evening-1',20)"></div><span class="tlabel" id="lbl-cal-24-evening-1">ทบทวนจุดสำคัญ</span></div></div></div></div><div class="dcard dc-peach" id="dc21"><div class="dhdr" onclick="toggleDay(21)">
+      <div class="dbox" style="background:#fde8d0;color:#d87030"><span class="dn">25</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">กฎหมายบ้านเมืองที่ดี</div><div class="dsub">พี่แมงปอ: 200 ข้อ บ้านเมืองที่ดี</div></div>
+      <div class="dprog" id="dp21" style="background:#fde8d0;color:#d87030">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds21"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">กฎหมายบ้านเมืองที่ดี</div><div class="task"><div class="chk" id="chk-cal-25-morning-0" onclick="toggleCal('cal-25-morning-0',21)"></div><span class="tlabel" id="lbl-cal-25-morning-0">หลักธรรมาภิบาล</span></div><div class="task"><div class="chk" id="chk-cal-25-morning-1" onclick="toggleCal('cal-25-morning-1',21)"></div><span class="tlabel" id="lbl-cal-25-morning-1">พ.ร.ฎ. หลักเกณฑ์บ้านเมืองที่ดี</span></div><div class="task"><div class="chk" id="chk-cal-25-morning-2" onclick="toggleCal('cal-25-morning-2',21)"></div><span class="tlabel" id="lbl-cal-25-morning-2">ตัวชี้วัดและแนวทางปฏิบัติ</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่แมงปอ: 200 ข้อ บ้านเมืองที่ดี</div><div class="task"><div class="chk" id="chk-cal-25-afternoon-0" onclick="toggleCal('cal-25-afternoon-0',21)"></div><span class="tlabel" id="lbl-cal-25-afternoon-0">ทำ 200 ข้อ บ้านเมืองที่ดี</span></div><div class="task"><div class="chk" id="chk-cal-25-afternoon-1" onclick="toggleCal('cal-25-afternoon-1',21)"></div><span class="tlabel" id="lbl-cal-25-afternoon-1">จดข้อที่ผิด</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">จด Keyword กฎหมาย</div><div class="task"><div class="chk" id="chk-cal-25-evening-0" onclick="toggleCal('cal-25-evening-0',21)"></div><span class="tlabel" id="lbl-cal-25-evening-0">จด Keyword กฎหมาย</span></div><div class="task"><div class="chk" id="chk-cal-25-evening-1" onclick="toggleCal('cal-25-evening-1',21)"></div><span class="tlabel" id="lbl-cal-25-evening-1">ทบทวน</span></div></div></div></div><div class="dcard dc-sky" id="dc22"><div class="dhdr" onclick="toggleDay(22)">
+      <div class="dbox" style="background:#d5eaf9;color:#3a88c8"><span class="dn">26</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">มาตรฐานจริยธรรม + กฎหมายอาญา</div><div class="dsub">พี่แมงปอ: 200 ข้อ จริยธรรม/อาญา</div></div>
+      <div class="dprog" id="dp22" style="background:#d5eaf9;color:#3a88c8">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds22"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">มาตรฐานจริยธรรม + กฎหมายอาญา</div><div class="task"><div class="chk" id="chk-cal-26-morning-0" onclick="toggleCal('cal-26-morning-0',22)"></div><span class="tlabel" id="lbl-cal-26-morning-0">มาตรฐานจริยธรรมข้าราชการ</span></div><div class="task"><div class="chk" id="chk-cal-26-morning-1" onclick="toggleCal('cal-26-morning-1',22)"></div><span class="tlabel" id="lbl-cal-26-morning-1">ประมวลจริยธรรม</span></div><div class="task"><div class="chk" id="chk-cal-26-morning-2" onclick="toggleCal('cal-26-morning-2',22)"></div><span class="tlabel" id="lbl-cal-26-morning-2">กฎหมายอาญาที่เกี่ยวข้อง</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่แมงปอ: 200 ข้อ จริยธรรม/อาญา</div><div class="task"><div class="chk" id="chk-cal-26-afternoon-0" onclick="toggleCal('cal-26-afternoon-0',22)"></div><span class="tlabel" id="lbl-cal-26-afternoon-0">ทำ 200 ข้อ จริยธรรม/อาญา</span></div><div class="task"><div class="chk" id="chk-cal-26-afternoon-1" onclick="toggleCal('cal-26-afternoon-1',22)"></div><span class="tlabel" id="lbl-cal-26-afternoon-1">จดข้อที่ผิด</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">ทวนกฎหมายทั้งหมด</div><div class="task"><div class="chk" id="chk-cal-26-evening-0" onclick="toggleCal('cal-26-evening-0',22)"></div><span class="tlabel" id="lbl-cal-26-evening-0">ทบทวนกฎหมายทั้งหมด</span></div><div class="task"><div class="chk" id="chk-cal-26-evening-1" onclick="toggleCal('cal-26-evening-1',22)"></div><span class="tlabel" id="lbl-cal-26-evening-1">จัดลำดับความสำคัญ</span></div></div></div></div><div class="dcard dc-yellow" id="dc23"><div class="dhdr" onclick="toggleDay(23)">
+      <div class="dbox" style="background:#fff8d0;color:#b89a10"><span class="dn">27</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">ตะลุยโจทย์ผสมทุกวิชา</div><div class="dsub">พี่น้อต: ติวโค้งสุดท้าย ภาค ก.</div></div>
+      <div class="dprog" id="dp23" style="background:#fff8d0;color:#b89a10">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds23"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">ตะลุยโจทย์ผสมทุกวิชา</div><div class="task"><div class="chk" id="chk-cal-27-morning-0" onclick="toggleCal('cal-27-morning-0',23)"></div><span class="tlabel" id="lbl-cal-27-morning-0">ทำโจทย์คณิตผสม</span></div><div class="task"><div class="chk" id="chk-cal-27-morning-1" onclick="toggleCal('cal-27-morning-1',23)"></div><span class="tlabel" id="lbl-cal-27-morning-1">ทำโจทย์ภาษาผสม</span></div><div class="task"><div class="chk" id="chk-cal-27-morning-2" onclick="toggleCal('cal-27-morning-2',23)"></div><span class="tlabel" id="lbl-cal-27-morning-2">ทำโจทย์กฎหมายผสม</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่น้อต: ติวโค้งสุดท้าย ภาค ก.</div><div class="task"><div class="chk" id="chk-cal-27-afternoon-0" onclick="toggleCal('cal-27-afternoon-0',23)"></div><span class="tlabel" id="lbl-cal-27-afternoon-0">ดูคลิปโค้งสุดท้าย</span></div><div class="task"><div class="chk" id="chk-cal-27-afternoon-1" onclick="toggleCal('cal-27-afternoon-1',23)"></div><span class="tlabel" id="lbl-cal-27-afternoon-1">จดเทคนิคสำคัญ</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">รวมจุดที่มักพลาด</div><div class="task"><div class="chk" id="chk-cal-27-evening-0" onclick="toggleCal('cal-27-evening-0',23)"></div><span class="tlabel" id="lbl-cal-27-evening-0">รวบรวมจุดผิดทั้งหมด</span></div><div class="task"><div class="chk" id="chk-cal-27-evening-1" onclick="toggleCal('cal-27-evening-1',23)"></div><span class="tlabel" id="lbl-cal-27-evening-1">วางแผนทบทวน</span></div></div></div></div><div class="dcard dc-pink" id="dc24"><div class="dhdr" onclick="toggleDay(24)">
+      <div class="dbox" style="background:#f9d5e0;color:#d9638a"><span class="dn">28</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">Mock Test #1 (จับเวลา)</div><div class="dsub">เฉลยละเอียด + วิเคราะห์จุดอ่อน</div></div>
+      <div class="dprog" id="dp24" style="background:#f9d5e0;color:#d9638a">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds24"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">Mock Test #1 (จับเวลา)</div><div class="task"><div class="chk" id="chk-cal-28-morning-0" onclick="toggleCal('cal-28-morning-0',24)"></div><span class="tlabel" id="lbl-cal-28-morning-0">ทำ Mock Test #1 เต็มชุด</span></div><div class="task"><div class="chk" id="chk-cal-28-morning-1" onclick="toggleCal('cal-28-morning-1',24)"></div><span class="tlabel" id="lbl-cal-28-morning-1">จับเวลาเหมือนสอบจริง</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">เฉลยละเอียด + วิเคราะห์จุดอ่อน</div><div class="task"><div class="chk" id="chk-cal-28-afternoon-0" onclick="toggleCal('cal-28-afternoon-0',24)"></div><span class="tlabel" id="lbl-cal-28-afternoon-0">เช็คเฉลยทุกข้อ</span></div><div class="task"><div class="chk" id="chk-cal-28-afternoon-1" onclick="toggleCal('cal-28-afternoon-1',24)"></div><span class="tlabel" id="lbl-cal-28-afternoon-1">วิเคราะห์จุดอ่อนหลัก</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">จด Pic Recap Mock #1</div><div class="task"><div class="chk" id="chk-cal-28-evening-0" onclick="toggleCal('cal-28-evening-0',24)"></div><span class="tlabel" id="lbl-cal-28-evening-0">จด Pic Recap Mock #1</span></div><div class="task"><div class="chk" id="chk-cal-28-evening-1" onclick="toggleCal('cal-28-evening-1',24)"></div><span class="tlabel" id="lbl-cal-28-evening-1">วางแผนแก้ไข</span></div></div></div></div><div class="dcard dc-mint" id="dc25"><div class="dhdr" onclick="toggleDay(25)">
+      <div class="dbox" style="background:#d4f0e8;color:#3aaa8c"><span class="dn">29</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">Mock Test #2 (จับเวลา)</div><div class="dsub">เฉลยละเอียด + เก็บตก</div></div>
+      <div class="dprog" id="dp25" style="background:#d4f0e8;color:#3aaa8c">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds25"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">Mock Test #2 (จับเวลา)</div><div class="task"><div class="chk" id="chk-cal-29-morning-0" onclick="toggleCal('cal-29-morning-0',25)"></div><span class="tlabel" id="lbl-cal-29-morning-0">ทำ Mock Test #2 เต็มชุด</span></div><div class="task"><div class="chk" id="chk-cal-29-morning-1" onclick="toggleCal('cal-29-morning-1',25)"></div><span class="tlabel" id="lbl-cal-29-morning-1">จับเวลาเหมือนสอบจริง</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">เฉลยละเอียด + เก็บตก</div><div class="task"><div class="chk" id="chk-cal-29-afternoon-0" onclick="toggleCal('cal-29-afternoon-0',25)"></div><span class="tlabel" id="lbl-cal-29-afternoon-0">เช็คเฉลยทุกข้อ</span></div><div class="task"><div class="chk" id="chk-cal-29-afternoon-1" onclick="toggleCal('cal-29-afternoon-1',25)"></div><span class="tlabel" id="lbl-cal-29-afternoon-1">เก็บตกจุดผิด Mock #1–#2</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">จด Pic Recap Mock #2</div><div class="task"><div class="chk" id="chk-cal-29-evening-0" onclick="toggleCal('cal-29-evening-0',25)"></div><span class="tlabel" id="lbl-cal-29-evening-0">จด Pic Recap Mock #2</span></div><div class="task"><div class="chk" id="chk-cal-29-evening-1" onclick="toggleCal('cal-29-evening-1',25)"></div><span class="tlabel" id="lbl-cal-29-evening-1">ทบทวนสูตรสำคัญ</span></div></div></div></div><div class="dcard dc-lavender" id="dc26"><div class="dhdr" onclick="toggleDay(26)">
+      <div class="dbox" style="background:#e8dff5;color:#7050b0"><span class="dn">30</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">ทบทวน Pic Recap ทั้งหมด</div><div class="dsub">พี่ขิม: สูตรลับคณิต (รอบ 2)</div></div>
+      <div class="dprog" id="dp26" style="background:#e8dff5;color:#7050b0">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds26"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">ทบทวน Pic Recap ทั้งหมด</div><div class="task"><div class="chk" id="chk-cal-30-morning-0" onclick="toggleCal('cal-30-morning-0',26)"></div><span class="tlabel" id="lbl-cal-30-morning-0">อ่าน Pic Recap ทุกอัน</span></div><div class="task"><div class="chk" id="chk-cal-30-morning-1" onclick="toggleCal('cal-30-morning-1',26)"></div><span class="tlabel" id="lbl-cal-30-morning-1">ทบทวนสูตร/หลักการสำคัญ</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พี่ขิม: สูตรลับคณิต (รอบ 2)</div><div class="task"><div class="chk" id="chk-cal-30-afternoon-0" onclick="toggleCal('cal-30-afternoon-0',26)"></div><span class="tlabel" id="lbl-cal-30-afternoon-0">ดูคลิปสูตรลับรอบ 2</span></div><div class="task"><div class="chk" id="chk-cal-30-afternoon-1" onclick="toggleCal('cal-30-afternoon-1',26)"></div><span class="tlabel" id="lbl-cal-30-afternoon-1">จดเพิ่มเติม</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">เตรียมอุปกรณ์สอบ</div><div class="task"><div class="chk" id="chk-cal-30-evening-0" onclick="toggleCal('cal-30-evening-0',26)"></div><span class="tlabel" id="lbl-cal-30-evening-0">เตรียมบัตรสอบ/บัตรประชาชน</span></div><div class="task"><div class="chk" id="chk-cal-30-evening-1" onclick="toggleCal('cal-30-evening-1',26)"></div><span class="tlabel" id="lbl-cal-30-evening-1">เตรียมเครื่องเขียน</span></div></div></div></div><div class="dcard dc-peach" id="dc27"><div class="dhdr" onclick="toggleDay(27)">
+      <div class="dbox" style="background:#fde8d0;color:#d87030"><span class="dn">31</span><span class="dm">มี.ค.</span></div>
+      <div class="dinfo"><div class="dtitle">อ่านสรุป 1 หน้า (เบาๆ)</div><div class="dsub">พักผ่อน / จัดกระเป๋า</div></div>
+      <div class="dprog" id="dp27" style="background:#fde8d0;color:#d87030">0%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds27"><div class="scard morning"><div class="stime">☀️ 08:00 – 12:00 (พี่บัส)</div><div class="stitle">อ่านสรุป 1 หน้า (เบาๆ)</div><div class="task"><div class="chk" id="chk-cal-31 🎯-morning-0" onclick="toggleCal('cal-31 🎯-morning-0',27)"></div><span class="tlabel" id="lbl-cal-31 🎯-morning-0">อ่านสรุปคณิต</span></div><div class="task"><div class="chk" id="chk-cal-31 🎯-morning-1" onclick="toggleCal('cal-31 🎯-morning-1',27)"></div><span class="tlabel" id="lbl-cal-31 🎯-morning-1">อ่านสรุปกฎหมาย</span></div><div class="task"><div class="chk" id="chk-cal-31 🎯-morning-2" onclick="toggleCal('cal-31 🎯-morning-2',27)"></div><span class="tlabel" id="lbl-cal-31 🎯-morning-2">อ่านสรุปอังกฤษ</span></div></div><div class="scard afternoon"><div class="stime">🌤 13:00 – 16:00 (พี่ขิม/น้อต/แมงปอ)</div><div class="stitle">พักผ่อน / จัดกระเป๋า</div><div class="task"><div class="chk" id="chk-cal-31 🎯-afternoon-0" onclick="toggleCal('cal-31 🎯-afternoon-0',27)"></div><span class="tlabel" id="lbl-cal-31 🎯-afternoon-0">จัดกระเป๋าให้เรียบร้อย</span></div><div class="task"><div class="chk" id="chk-cal-31 🎯-afternoon-1" onclick="toggleCal('cal-31 🎯-afternoon-1',27)"></div><span class="tlabel" id="lbl-cal-31 🎯-afternoon-1">พักผ่อนเต็มที่</span></div></div><div class="scard evening"><div class="stime">🌙 20:00 – 21:00 (ทบทวน)</div><div class="stitle">เข้านอนหัวค่ำ 💤</div><div class="task"><div class="chk" id="chk-cal-31 🎯-evening-0" onclick="toggleCal('cal-31 🎯-evening-0',27)"></div><span class="tlabel" id="lbl-cal-31 🎯-evening-0">งดโทรศัพท์</span></div><div class="task"><div class="chk" id="chk-cal-31 🎯-evening-1" onclick="toggleCal('cal-31 🎯-evening-1',27)"></div><span class="tlabel" id="lbl-cal-31 🎯-evening-1">นอนไม่เกิน 22:00 น.</span></div></div></div></div></div></div>
+  <div id="page-todo" class="page"><div class="sectitle">✅ To-Do แยกวิชา <span class="pill">เช็คความคืบหน้า</span></div><div class="subjbar"><button class="stab active" data-s="math">🔢 คณิตศาสตร์</button><button class="stab" data-s="law">⚖️ กฎหมาย</button><button class="stab" data-s="eng">🇬🇧 ภาษาอังกฤษ</button></div><div class="spanel smath active" id="sp-math"><div class="tsec"><div class="tsectitle pink">เลขและการดำเนินการ</div><div class="tdone-lbl" id="tdl-math-เลขและการดำเนินการ">0/7 เสร็จแล้ว</div><div class="titem"><div class="tchk" id="tc-todo-math-เลขและการดำเนินการ-0" onclick="toggleTodo('todo-math-เลขและการดำเนินการ-0','math','เลขและการดำเนินการ',7)"></div><span class="ttext" id="tt-todo-math-เลขและการดำเนินการ-0">อนุกรมเลขคณิต</span></div><div class="titem"><div class="tchk" id="tc-todo-math-เลขและการดำเนินการ-1" onclick="toggleTodo('todo-math-เลขและการดำเนินการ-1','math','เลขและการดำเนินการ',7)"></div><span class="ttext" id="tt-todo-math-เลขและการดำเนินการ-1">อนุกรมเรขาคณิต</span></div><div class="titem"><div class="tchk" id="tc-todo-math-เลขและการดำเนินการ-2" onclick="toggleTodo('todo-math-เลขและการดำเนินการ-2','math','เลขและการดำเนินการ',7)"></div><span class="ttext" id="tt-todo-math-เลขและการดำเนินการ-2">อนุกรมพิเศษ/ผสม</span></div><div class="titem"><div class="tchk" id="tc-todo-math-เลขและการดำเนินการ-3" onclick="toggleTodo('todo-math-เลขและการดำเนินการ-3','math','เลขและการดำเนินการ',7)"></div><span class="ttext" id="tt-todo-math-เลขและการดำเนินการ-3">Operation</span></div><div class="titem"><div class="tchk" id="tc-todo-math-เลขและการดำเนินการ-4" onclick="toggleTodo('todo-math-เลขและการดำเนินการ-4','math','เลขและการดำเนินการ',7)"></div><span class="ttext" id="tt-todo-math-เลขและการดำเนินการ-4">ห.ร.ม. และ ค.ร.น.</span></div><div class="titem"><div class="tchk" id="tc-todo-math-เลขและการดำเนินการ-5" onclick="toggleTodo('todo-math-เลขและการดำเนินการ-5','math','เลขและการดำเนินการ',7)"></div><span class="ttext" id="tt-todo-math-เลขและการดำเนินการ-5">อัตราส่วนและสัดส่วน</span></div><div class="titem"><div class="tchk" id="tc-todo-math-เลขและการดำเนินการ-6" onclick="toggleTodo('todo-math-เลขและการดำเนินการ-6','math','เลขและการดำเนินการ',7)"></div><span class="ttext" id="tt-todo-math-เลขและการดำเนินการ-6">ของผสมและสารละลาย</span></div></div><div class="tsec"><div class="tsectitle peach">ร้อยละและดอกเบี้ย</div><div class="tdone-lbl" id="tdl-math-ร้อยละและดอกเบี้ย">0/5 เสร็จแล้ว</div><div class="titem"><div class="tchk" id="tc-todo-math-ร้อยละและดอกเบี้ย-0" onclick="toggleTodo('todo-math-ร้อยละและดอกเบี้ย-0','math','ร้อยละและดอกเบี้ย',5)"></div><span class="ttext" id="tt-todo-math-ร้อยละและดอกเบี้ย-0">ร้อยละ/เปอร์เซ็นต์</span></div><div class="titem"><div class="tchk" id="tc-todo-math-ร้อยละและดอกเบี้ย-1" onclick="toggleTodo('todo-math-ร้อยละและดอกเบี้ย-1','math','ร้อยละและดอกเบี้ย',5)"></div><span class="ttext" id="tt-todo-math-ร้อยละและดอกเบี้ย-1">กำไร-ขาดทุน</span></div><div class="titem"><div class="tchk" id="tc-todo-math-ร้อยละและดอกเบี้ย-2" onclick="toggleTodo('todo-math-ร้อยละและดอกเบี้ย-2','math','ร้อยละและดอกเบี้ย',5)"></div><span class="ttext" id="tt-todo-math-ร้อยละและดอกเบี้ย-2">ส่วนลด/ราคาขาย</span></div><div class="titem"><div class="tchk" id="tc-todo-math-ร้อยละและดอกเบี้ย-3" onclick="toggleTodo('todo-math-ร้อยละและดอกเบี้ย-3','math','ร้อยละและดอกเบี้ย',5)"></div><span class="ttext" id="tt-todo-math-ร้อยละและดอกเบี้ย-3">ดอกเบี้ยอย่างง่าย</span></div><div class="titem"><div class="tchk" id="tc-todo-math-ร้อยละและดอกเบี้ย-4" onclick="toggleTodo('todo-math-ร้อยละและดอกเบี้ย-4','math','ร้อยละและดอกเบี้ย',5)"></div><span class="ttext" id="tt-todo-math-ร้อยละและดอกเบี้ย-4">ดอกเบี้ยทบต้น</span></div></div><div class="tsec"><div class="tsectitle lavender">สมการและพีชคณิต</div><div class="tdone-lbl" id="tdl-math-สมการและพีชคณิต">0/4 เสร็จแล้ว</div><div class="titem"><div class="tchk" id="tc-todo-math-สมการและพีชคณิต-0" onclick="toggleTodo('todo-math-สมการและพีชคณิต-0','math','สมการและพีชคณิต',4)"></div><span class="ttext" id="tt-todo-math-สมการและพีชคณิต-0">สมการเชิงเส้น 1 ตัวแปร</span></div><div class="titem"><div class="tchk" id="tc-todo-math-สมการและพีชคณิต-1" onclick="toggleTodo('todo-math-สมการและพีชคณิต-1','math','สมการและพีชคณิต',4)"></div><span class="ttext" id="tt-todo-math-สมการและพีชคณิต-1">สมการ 2 ตัวแปร</span></div><div class="titem"><div class="tchk" id="tc-todo-math-สมการและพีชคณิต-2" onclick="toggleTodo('todo-math-สมการและพีชคณิต-2','math','สมการและพีชคณิต',4)"></div><span class="ttext" id="tt-todo-math-สมการและพีชคณิต-2">โจทย์อายุ</span></div><div class="titem"><div class="tchk" id="tc-todo-math-สมการและพีชคณิต-3" onclick="toggleTodo('todo-math-สมการและพีชคณิต-3','math','สมการและพีชคณิต',4)"></div><span class="ttext" id="tt-todo-math-สมการและพีชคณิต-3">โจทย์งานและอัตราเร็ว</span></div></div><div class="tsec"><div class="tsectitle sky">เรขาคณิตและสถิติ</div><div class="tdone-lbl" id="tdl-math-เรขาคณิตและสถิติ">0/4 เสร็จแล้ว</div><div class="titem"><div class="tchk" id="tc-todo-math-เรขาคณิตและสถิติ-0" onclick="toggleTodo('todo-math-เรขาคณิตและสถิติ-0','math','เรขาคณิตและสถิติ',4)"></div><span class="ttext" id="tt-todo-math-เรขาคณิตและสถิติ-0">พื้นที่รูปทรง 2 มิติ</span></div><div class="titem"><div class="tchk" id="tc-todo-math-เรขาคณิตและสถิติ-1" onclick="toggleTodo('todo-math-เรขาคณิตและสถิติ-1','math','เรขาคณิตและสถิติ',4)"></div><span class="ttext" id="tt-todo-math-เรขาคณิตและสถิติ-1">ปริมาตรรูปทรง 3 มิติ</span></div><div class="titem"><div class="tchk" id="tc-todo-math-เรขาคณิตและสถิติ-2" onclick="toggleTodo('todo-math-เรขาคณิตและสถิติ-2','math','เรขาคณิตและสถิติ',4)"></div><span class="ttext" id="tt-todo-math-เรขาคณิตและสถิติ-2">Mean / Median / Mode</span></div><div class="titem"><div class="tchk" id="tc-todo-math-เรขาคณิตและสถิติ-3" onclick="toggleTodo('todo-math-เรขาคณิตและสถิติ-3','math','เรขาคณิตและสถิติ',4)"></div><span class="ttext" id="tt-todo-math-เรขาคณิตและสถิติ-3">วิเคราะห์ตารางข้อมูล</span></div></div><div class="tsec"><div class="tsectitle mint">ตรรกะและเงื่อนไข</div><div class="tdone-lbl" id="tdl-math-ตรรกะและเงื่อนไข">0/4 เสร็จแล้ว</div><div class="titem"><div class="tchk" id="tc-todo-math-ตรรกะและเงื่อนไข-0" onclick="toggleTodo('todo-math-ตรรกะและเงื่อนไข-0','math','ตรรกะและเงื่อนไข',4)"></div><span class="ttext" id="tt-todo-math-ตรรกะและเงื่อนไข-0">เงื่อนไขสัญลักษณ์พื้นฐาน</span></div><div class="titem"><div class="tchk" id="tc-todo-math-ตรรกะและเงื่อนไข-1" onclick="toggleTodo('todo-math-ตรรกะและเงื่อนไข-1','math','ตรรกะและเงื่อนไข',4)"></div><span class="ttext" id="tt-todo-math-ตรรกะและเงื่อนไข-1">เงื่อนไขสัญลักษณ์ผสม</span></div><div class="titem"><div class="tchk" id="tc-todo-math-ตรรกะและเงื่อนไข-2" onclick="toggleTodo('todo-math-ตรรกะและเงื่อนไข-2','math','ตรรกะและเงื่อนไข',4)"></div><span class="ttext" id="tt-todo-math-ตรรกะและเงื่อนไข-2">เงื่อนไขภาษา</span></div><div class="titem"><div class="tchk" id="tc-todo-math-ตรรกะและเงื่อนไข-3" onclick="toggleTodo('todo-math-ตรรกะและเงื่อนไข-3','math','ตรรกะและเงื่อนไข',4)"></div><span class="ttext" id="tt-todo-math-ตรรกะและเงื่อนไข-3">อุปมาอุปไมย</span></div></div></div><div class="spanel slaw" id="sp-law"><div class="tsec"><div class="tsectitle lavender">กฎหมายพื้นฐาน</div><div class="tdone-lbl" id="tdl-law-กฎหมายพื้นฐาน">0/4 เสร็จแล้ว</div><div class="titem"><div class="tchk" id="tc-todo-law-กฎหมายพื้นฐาน-0" onclick="toggleTodo('todo-law-กฎหมายพื้นฐาน-0','law','กฎหมายพื้นฐาน',4)"></div><span class="ttext" id="tt-todo-law-กฎหมายพื้นฐาน-0">กฎหมายอาญาที่เกี่ยวข้อง</span></div><div class="titem"><div class="tchk" id="tc-todo-law-กฎหมายพื้นฐาน-1" onclick="toggleTodo('todo-law-กฎหมายพื้นฐาน-1','law','กฎหมายพื้นฐาน',4)"></div><span class="ttext" id="tt-todo-law-กฎหมายพื้นฐาน-1">หลักธรรมาภิบาล</span></div><div class="titem"><div class="tchk" id="tc-todo-law-กฎหมายพื้นฐาน-2" onclick="toggleTodo('todo-law-กฎหมายพื้นฐาน-2','law','กฎหมายพื้นฐาน',4)"></div><span class="ttext" id="tt-todo-law-กฎหมายพื้นฐาน-2">มาตรฐานจริยธรรม</span></div><div class="titem"><div class="tchk" id="tc-todo-law-กฎหมายพื้นฐาน-3" onclick="toggleTodo('todo-law-กฎหมายพื้นฐาน-3','law','กฎหมายพื้นฐาน',4)"></div><span class="ttext" id="tt-todo-law-กฎหมายพื้นฐาน-3">ประมวลจริยธรรม</span></div></div><div class="tsec"><div class="tsectitle sky">การบริหารราชการ</div><div class="tdone-lbl" id="tdl-law-การบริหารราชการ">0/4 เสร็จแล้ว</div><div class="titem"><div class="tchk" id="tc-todo-law-การบริหารราชการ-0" onclick="toggleTodo('todo-law-การบริหารราชการ-0','law','การบริหารราชการ',4)"></div><span class="ttext" id="tt-todo-law-การบริหารราชการ-0">ราชการส่วนกลาง</span></div><div class="titem"><div class="tchk" id="tc-todo-law-การบริหารราชการ-1" onclick="toggleTodo('todo-law-การบริหารราชการ-1','law','การบริหารราชการ',4)"></div><span class="ttext" id="tt-todo-law-การบริหารราชการ-1">ราชการส่วนภูมิภาค</span></div><div class="titem"><div class="tchk" id="tc-todo-law-การบริหารราชการ-2" onclick="toggleTodo('todo-law-การบริหารราชการ-2','law','การบริหารราชการ',4)"></div><span class="ttext" id="tt-todo-law-การบริหารราชการ-2">ราชการส่วนท้องถิ่น</span></div><div class="titem"><div class="tchk" id="tc-todo-law-การบริหารราชการ-3" onclick="toggleTodo('todo-law-การบริหารราชการ-3','law','การบริหารราชการ',4)"></div><span class="ttext" id="tt-todo-law-การบริหารราชการ-3">พ.ร.บ. ระเบียบบริหารราชการแผ่นดิน</span></div></div><div class="tsec"><div class="tsectitle pink">กฎหมายปกครอง</div><div class="tdone-lbl" id="tdl-law-กฎหมายปกครอง">0/4 เสร็จแล้ว</div><div class="titem"><div class="tchk" id="tc-todo-law-กฎหมายปกครอง-0" onclick="toggleTodo('todo-law-กฎหมายปกครอง-0','law','กฎหมายปกครอง',4)"></div><span class="ttext" id="tt-todo-law-กฎหมายปกครอง-0">หลักกฎหมายปกครอง</span></div><div class="titem"><div class="tchk" id="tc-todo-law-กฎหมายปกครอง-1" onclick="toggleTodo('todo-law-กฎหมายปกครอง-1','law','กฎหมายปกครอง',4)"></div><span class="ttext" id="tt-todo-law-กฎหมายปกครอง-1">ความรับผิดทางละเมิด</span></div><div class="titem"><div class="tchk" id="tc-todo-law-กฎหมายปกครอง-2" onclick="toggleTodo('todo-law-กฎหมายปกครอง-2','law','กฎหมายปกครอง',4)"></div><span class="ttext" id="tt-todo-law-กฎหมายปกครอง-2">คดีปกครอง</span></div><div class="titem"><div class="tchk" id="tc-todo-law-กฎหมายปกครอง-3" onclick="toggleTodo('todo-law-กฎหมายปกครอง-3','law','กฎหมายปกครอง',4)"></div><span class="ttext" id="tt-todo-law-กฎหมายปกครอง-3">ขั้นตอนอุทธรณ์</span></div></div><div class="tsec"><div class="tsectitle mint">ข้อสอบรวม 200 ข้อ</div><div class="tdone-lbl" id="tdl-law-ข้อสอบรวม200ข้อ">0/4 เสร็จแล้ว</div><div class="titem"><div class="tchk" id="tc-todo-law-ข้อสอบรวม 200 ข้อ-0" onclick="toggleTodo('todo-law-ข้อสอบรวม 200 ข้อ-0','law','ข้อสอบรวม 200 ข้อ',4)"></div><span class="ttext" id="tt-todo-law-ข้อสอบรวม 200 ข้อ-0">บริหารราชการแผ่นดิน</span></div><div class="titem"><div class="tchk" id="tc-todo-law-ข้อสอบรวม 200 ข้อ-1" onclick="toggleTodo('todo-law-ข้อสอบรวม 200 ข้อ-1','law','ข้อสอบรวม 200 ข้อ',4)"></div><span class="ttext" id="tt-todo-law-ข้อสอบรวม 200 ข้อ-1">ปกครอง/ละเมิด</span></div><div class="titem"><div class="tchk" id="tc-todo-law-ข้อสอบรวม 200 ข้อ-2" onclick="toggleTodo('todo-law-ข้อสอบรวม 200 ข้อ-2','law','ข้อสอบรวม 200 ข้อ',4)"></div><span class="ttext" id="tt-todo-law-ข้อสอบรวม 200 ข้อ-2">บ้านเมืองที่ดี</span></div><div class="titem"><div class="tchk" id="tc-todo-law-ข้อสอบรวม 200 ข้อ-3" onclick="toggleTodo('todo-law-ข้อสอบรวม 200 ข้อ-3','law','ข้อสอบรวม 200 ข้อ',4)"></div><span class="ttext" id="tt-todo-law-ข้อสอบรวม 200 ข้อ-3">จริยธรรม/อาญา</span></div></div></div><div class="spanel seng" id="sp-eng"><div class="tsec"><div class="tsectitle mint">คำศัพท์ 30 ผลึก</div><div class="tdone-lbl" id="tdl-eng-คำศัพท์30ผลึก">0/3 เสร็จแล้ว</div><div class="titem"><div class="tchk" id="tc-todo-eng-คำศัพท์ 30 ผลึก-0" onclick="toggleTodo('todo-eng-คำศัพท์ 30 ผลึก-0','eng','คำศัพท์ 30 ผลึก',3)"></div><span class="ttext" id="tt-todo-eng-คำศัพท์ 30 ผลึก-0">ผลึกอังกฤษ 1-10</span></div><div class="titem"><div class="tchk" id="tc-todo-eng-คำศัพท์ 30 ผลึก-1" onclick="toggleTodo('todo-eng-คำศัพท์ 30 ผลึก-1','eng','คำศัพท์ 30 ผลึก',3)"></div><span class="ttext" id="tt-todo-eng-คำศัพท์ 30 ผลึก-1">ผลึกอังกฤษ 11-20</span></div><div class="titem"><div class="tchk" id="tc-todo-eng-คำศัพท์ 30 ผลึก-2" onclick="toggleTodo('todo-eng-คำศัพท์ 30 ผลึก-2','eng','คำศัพท์ 30 ผลึก',3)"></div><span class="ttext" id="tt-todo-eng-คำศัพท์ 30 ผลึก-2">ผลึกอังกฤษ 21-30</span></div></div><div class="tsec"><div class="tsectitle sky">Grammar</div><div class="tdone-lbl" id="tdl-eng-Grammar">0/5 เสร็จแล้ว</div><div class="titem"><div class="tchk" id="tc-todo-eng-Grammar-0" onclick="toggleTodo('todo-eng-Grammar-0','eng','Grammar',5)"></div><span class="ttext" id="tt-todo-eng-Grammar-0">Tense ต่างๆ</span></div><div class="titem"><div class="tchk" id="tc-todo-eng-Grammar-1" onclick="toggleTodo('todo-eng-Grammar-1','eng','Grammar',5)"></div><span class="ttext" id="tt-todo-eng-Grammar-1">Subject-Verb Agreement</span></div><div class="titem"><div class="tchk" id="tc-todo-eng-Grammar-2" onclick="toggleTodo('todo-eng-Grammar-2','eng','Grammar',5)"></div><span class="ttext" id="tt-todo-eng-Grammar-2">Conjunctions</span></div><div class="titem"><div class="tchk" id="tc-todo-eng-Grammar-3" onclick="toggleTodo('todo-eng-Grammar-3','eng','Grammar',5)"></div><span class="ttext" id="tt-todo-eng-Grammar-3">Prepositions</span></div><div class="titem"><div class="tchk" id="tc-todo-eng-Grammar-4" onclick="toggleTodo('todo-eng-Grammar-4','eng','Grammar',5)"></div><span class="ttext" id="tt-todo-eng-Grammar-4">Articles</span></div></div><div class="tsec"><div class="tsectitle peach">Reading &amp; Conversation</div><div class="tdone-lbl" id="tdl-eng-Reading&amp;Conversation">0/4 เสร็จแล้ว</div><div class="titem"><div class="tchk" id="tc-todo-eng-Reading &amp; Conversation-0" onclick="toggleTodo('todo-eng-Reading &amp; Conversation-0','eng','Reading &amp; Conversation',4)"></div><span class="ttext" id="tt-todo-eng-Reading &amp; Conversation-0">บทสนทนาสถานการณ์ต่างๆ</span></div><div class="titem"><div class="tchk" id="tc-todo-eng-Reading &amp; Conversation-1" onclick="toggleTodo('todo-eng-Reading &amp; Conversation-1','eng','Reading &amp; Conversation',4)"></div><span class="ttext" id="tt-todo-eng-Reading &amp; Conversation-1">Idioms/Fixed expressions</span></div><div class="titem"><div class="tchk" id="tc-todo-eng-Reading &amp; Conversation-2" onclick="toggleTodo('todo-eng-Reading &amp; Conversation-2','eng','Reading &amp; Conversation',4)"></div><span class="ttext" id="tt-todo-eng-Reading &amp; Conversation-2">อ่านบทความภาษาอังกฤษ</span></div><div class="titem"><div class="tchk" id="tc-todo-eng-Reading &amp; Conversation-3" onclick="toggleTodo('todo-eng-Reading &amp; Conversation-3','eng','Reading &amp; Conversation',4)"></div><span class="ttext" id="tt-todo-eng-Reading &amp; Conversation-3">ตีความบทความ</span></div></div></div></div>
+  <div id="page-progress" class="page"><div class="sectitle">📊 Progress ความคืบหน้า <span class="pill">ทุกวิชา</span></div><div class="prog-overall"><div class="pring-wrap"><svg width="90" height="90" viewBox="0 0 90 90">
+    <circle cx="45" cy="45" r="40" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="9"></circle>
+    <circle cx="45" cy="45" r="40" fill="none" stroke="#f0a8bb" stroke-width="9" stroke-dasharray="0.0 251.3" stroke-linecap="round"></circle></svg>
+    <div class="pring-txt"><div class="pring-pct">0%</div><div class="pring-lbl">สำเร็จ</div></div></div>
+    <div class="pov-info"><h2>ภาพรวมทั้งหมด</h2><p>รายการที่ทำเสร็จแล้ว</p><div class="pov-counts">0<span style="font-size:16px;opacity:.6"> / 249</span></div></div></div><div class="pcards"><div class="pcard cp"><div class="pcard-hdr"><div class="pcard-title">🔢 คณิตศาสตร์</div><div class="pcard-pct">0%</div></div>
+      <div class="pbar-wrap"><div class="pbar-fill" style="width:0%"></div></div><div><div class="psrow"><div class="psname">เลขและการดำเนินการ</div><div class="psmini-w"><div class="psmini" style="width:0%"></div></div><div class="psval">0/7</div></div><div class="psrow"><div class="psname">ร้อยละและดอกเบี้ย</div><div class="psmini-w"><div class="psmini" style="width:0%"></div></div><div class="psval">0/5</div></div><div class="psrow"><div class="psname">สมการและพีชคณิต</div><div class="psmini-w"><div class="psmini" style="width:0%"></div></div><div class="psval">0/4</div></div><div class="psrow"><div class="psname">เรขาคณิตและสถิติ</div><div class="psmini-w"><div class="psmini" style="width:0%"></div></div><div class="psval">0/4</div></div><div class="psrow"><div class="psname">ตรรกะและเงื่อนไข</div><div class="psmini-w"><div class="psmini" style="width:0%"></div></div><div class="psval">0/4</div></div></div></div><div class="pcard cl"><div class="pcard-hdr"><div class="pcard-title">⚖️ กฎหมาย</div><div class="pcard-pct">0%</div></div>
+      <div class="pbar-wrap"><div class="pbar-fill" style="width:0%"></div></div><div><div class="psrow"><div class="psname">กฎหมายพื้นฐาน</div><div class="psmini-w"><div class="psmini" style="width:0%"></div></div><div class="psval">0/4</div></div><div class="psrow"><div class="psname">การบริหารราชการ</div><div class="psmini-w"><div class="psmini" style="width:0%"></div></div><div class="psval">0/4</div></div><div class="psrow"><div class="psname">กฎหมายปกครอง</div><div class="psmini-w"><div class="psmini" style="width:0%"></div></div><div class="psval">0/4</div></div><div class="psrow"><div class="psname">ข้อสอบรวม 200 ข้อ</div><div class="psmini-w"><div class="psmini" style="width:0%"></div></div><div class="psval">0/4</div></div></div></div><div class="pcard cm"><div class="pcard-hdr"><div class="pcard-title">🇬🇧 ภาษาอังกฤษ</div><div class="pcard-pct">0%</div></div>
+      <div class="pbar-wrap"><div class="pbar-fill" style="width:0%"></div></div><div><div class="psrow"><div class="psname">คำศัพท์ 30 ผลึก</div><div class="psmini-w"><div class="psmini" style="width:0%"></div></div><div class="psval">0/3</div></div><div class="psrow"><div class="psname">Grammar</div><div class="psmini-w"><div class="psmini" style="width:0%"></div></div><div class="psval">0/5</div></div><div class="psrow"><div class="psname">Reading &amp; Conversation</div><div class="psmini-w"><div class="psmini" style="width:0%"></div></div><div class="psval">0/4</div></div></div></div></div></div>
+  <div id="page-countdown" class="page"><div class="sectitle">⏳ Countdown สอบ ก.พ. <span class="pill">2569</span></div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-bottom:16px">
+    <div class="cd-hero" style="margin-bottom:0"><div class="cd-pre">🖥️ อิเล็กทรอนิกส์</div><div class="cd-ttl">สอบ ก.พ. ภาค ก. 2569</div><div class="cd-dstr">วันเสาร์ที่ 23 พฤษภาคม 2569</div>
+      <div class="cd-nums">
+        <div class="cdu ud"><div class="cdn" id="cdd">--</div><div class="cdul">วัน</div></div>
+        <div class="cdu uh"><div class="cdn" id="cdh">--</div><div class="cdul">ชั่วโมง</div></div>
+        <div class="cdu um"><div class="cdn" id="cdm">--</div><div class="cdul">นาที</div></div>
+        <div class="cdu us"><div class="cdn" id="cds">--</div><div class="cdul">วินาที</div></div>
+      </div></div>
+    <div class="cd-hero" style="margin-bottom:0;background:linear-gradient(135deg,#d4f0e8 0%,#d5eaf9 50%,#e8dff5 100%)">
+      <div class="cd-pre">📝 เปเปอร์</div><div class="cd-ttl">สอบ ก.พ. ภาค ก. 2569</div><div class="cd-dstr">วันอาทิตย์ที่ 5 กรกฎาคม 2569</div>
+      <div class="cd-nums">
+        <div class="cdu ud"><div class="cdn" id="cdd2">--</div><div class="cdul">วัน</div></div>
+        <div class="cdu uh"><div class="cdn" id="cdh2">--</div><div class="cdul">ชั่วโมง</div></div>
+        <div class="cdu um"><div class="cdn" id="cdm2">--</div><div class="cdul">นาที</div></div>
+        <div class="cdu us"><div class="cdn" id="cds2">--</div><div class="cdul">วินาที</div></div>
+      </div></div>
+  </div>
+  <div class="sectitle" style="font-size:15px;margin-bottom:10px">📍 Milestone</div>
+  <div class="cd-ms-wrap" id="cdms"><div class="cdm"><div class="cdmdot done"></div><div class="cdmi"><div class="cdmname">เริ่มต้นติว ก.พ.</div><div class="cdmd">4 มี.ค. 69</div></div><div class="cdmleft past">ผ่านไปแล้ว 1 วัน</div></div><div class="cdm"><div class="cdmdot dpe"></div><div class="cdmi"><div class="cdmname">Mock Test #1</div><div class="cdmd">10 พ.ค. 69</div></div><div class="cdmleft far">อีก 66 วัน</div></div><div class="cdm"><div class="cdmdot ds"></div><div class="cdmi"><div class="cdmname">Mock Test #2</div><div class="cdmd">17 พ.ค. 69</div></div><div class="cdmleft far">อีก 73 วัน</div></div><div class="cdm"><div class="cdmdot dm"></div><div class="cdmi"><div class="cdmname">วันทบทวนสุดท้าย (อิเล็กทรอนิกส์)</div><div class="cdmd">22 พ.ค. 69</div></div><div class="cdmleft far">อีก 78 วัน</div></div><div class="cdm"><div class="cdmdot dp"></div><div class="cdmi"><div class="cdmname">🖥️ สอบ ก.พ. อิเล็กทรอนิกส์</div><div class="cdmd">23 พ.ค. 69</div></div><div class="cdmleft far">อีก 79 วัน</div></div><div class="cdm"><div class="cdmdot dl"></div><div class="cdmi"><div class="cdmname">วันทบทวนสุดท้าย (เปเปอร์)</div><div class="cdmd">4 ก.ค. 69</div></div><div class="cdmleft far">อีก 121 วัน</div></div><div class="cdm"><div class="cdmdot dpe"></div><div class="cdmi"><div class="cdmname">📝 สอบ ก.พ. เปเปอร์</div><div class="cdmd">5 ก.ค. 69</div></div><div class="cdmleft far">อีก 122 วัน</div></div></div></div>
+  <div id="page-timer" class="page"><div class="sectitle timer-page">⏱️ Mock Test Timer <span class="pill">จับเวลา</span></div>
+  <div class="timer-page">
+    <div class="presets" id="presets-grid"><div class="pset pactive" id="pset-full"><div class="pset-name">ข้อสอบเต็มชุด</div><div class="pset-detail">ก.พ. ภาค ก.</div><div class="pset-time">03:00:00</div></div><div class="pset" id="pset-half"><div class="pset-name">ครึ่งชุด</div><div class="pset-detail">1.5 ชั่วโมง</div><div class="pset-time">01:30:00</div></div><div class="pset" id="pset-quick"><div class="pset-name">Quick Drill</div><div class="pset-detail">30 นาที</div><div class="pset-time">00:30:00</div></div><div class="pset" id="pset-review"><div class="pset-name">ทบทวน</div><div class="pset-detail">20 นาที</div><div class="pset-time">00:20:00</div></div></div>
+    <div class="timer-hero">
+      <div class="tdisp" id="tdisp">03:00:00</div>
+      <div class="tsub" id="tsub">เลือกโหมดและกด เริ่ม</div>
+      <div class="tpw"><div class="tpf" id="tpf" style="width:100%"></div></div>
+      <div class="tbtns">
+        <button class="tbtn2 bt-start" onclick="timerStart()">▶ เริ่ม</button>
+        <button class="tbtn2 bt-pause" onclick="timerPause()">⏸ หยุด</button>
+        <button class="tbtn2 bt-reset" onclick="timerReset()">↺ รีเซ็ต</button>
+      </div>
+    </div>
+    <div class="mlog">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <div class="mlog-title" style="margin-bottom:0">📋 ประวัติการ Mock Test</div>
+        <button onclick="clearAllLogs()" style="font-size:11px;color:#d87030;background:#fde8d0;border:none;border-radius:8px;padding:4px 10px;cursor:pointer;font-family:Mitr,sans-serif">ลบทั้งหมด</button>
+      </div>
+      <div id="log-list"><div class="log-empty">ยังไม่มีประวัติ เริ่มทำ Mock Test ได้เลย! 💪</div></div>
+    </div>
+  </div></div>
+  <div id="page-recap" class="page"><div class="sectitle">📝 สูตรและเทคนิค <span class="pill">Pic Recap</span></div>
+  <div class="recaptabs">
+    <button class="rtab active" data-r="rmath" onclick="switchRecap('rmath',this)">🔢 คณิต</button>
+    <button class="rtab" data-r="rlaw" onclick="switchRecap('rlaw',this)">⚖️ กฎหมาย</button>
+    <button class="rtab" data-r="reng" onclick="switchRecap('reng',this)">🇬🇧 อังกฤษ</button>
+    <button class="rtab" data-r="rtip" onclick="switchRecap('rtip',this)">💡 เทคนิค</button>
+  </div>
+  <div id="rmath" class="rpanel active"><div class="fgrid"><div class="fc"><div class="ftopic pink">อนุกรม</div><div class="fmain">อนุกรมเลขคณิต: aₙ = a₁ + (n-1)d</div><div class="fnote">d = ผลต่างร่วม, Sₙ = n/2(a₁+aₙ)</div><div class="fex">✏️ 1,4,7,10... → d=3</div></div><div class="fc"><div class="ftopic pink">อนุกรม</div><div class="fmain">อนุกรมเรขาคณิต: aₙ = a₁·rⁿ⁻¹</div><div class="fnote">r = อัตราส่วนร่วม</div><div class="fex">✏️ 2,6,18,54... → r=3</div></div><div class="fc"><div class="ftopic peach">ร้อยละ</div><div class="fmain">กำไร% = (กำไร/ทุน) × 100</div><div class="fnote">ราคาขาย = ทุน + กำไร</div><div class="fex">✏️ ทุน 100, ขาย 120 → กำไร 20%</div></div><div class="fc"><div class="ftopic peach">ร้อยละ</div><div class="fmain">ส่วนลด = ราคาปกติ × อัตราส่วนลด%</div><div class="fnote">ราคาจริง = ราคาปกติ - ส่วนลด</div><div class="fex">✏️ 500 ลด 20% → จ่าย 400</div></div><div class="fc"><div class="ftopic lav">ดอกเบี้ย</div><div class="fmain">ดอกเบี้ยอย่างง่าย = PRT/100</div><div class="fnote">P=เงินต้น, R=อัตรา%, T=เวลา(ปี)</div><div class="fex">✏️ 1000×5%×2 = 100 บาท</div></div><div class="fc"><div class="ftopic lav">ดอกเบี้ย</div><div class="fmain">ดอกเบี้ยทบต้น = P(1+r)ⁿ - P</div><div class="fnote">r=อัตรา(ทศนิยม), n=จำนวนงวด</div><div class="fex">✏️ 1000(1.05)² - 1000 = 102.5</div></div><div class="fc"><div class="ftopic mint">สมการ</div><div class="fmain">โจทย์อายุ: กำหนด x=อายุปัจจุบัน</div><div class="fnote">อนาคต +n ปี / อดีต -n ปี</div><div class="fex">✏️ ปีนี้ x, 5 ปีหน้า = x+5</div></div><div class="fc"><div class="ftopic sky">สถิติ</div><div class="fmain">Mean = ผลรวมทั้งหมด / จำนวน</div><div class="fnote">Median = ค่ากลาง (เรียงลำดับก่อน)</div><div class="fex">✏️ Mode = ค่าที่ปรากฏบ่อยสุด</div></div><div class="fc"><div class="ftopic peach">พื้นที่</div><div class="fmain">สามเหลี่ยม = ½ × ฐาน × สูง</div><div class="fnote">สี่เหลี่ยมผืนผ้า = กว้าง × ยาว</div><div class="fex">✏️ วงกลม = πr²</div></div><div class="fc"><div class="ftopic mint">ปริมาตร</div><div class="fmain">ทรงกระบอก = πr²h</div><div class="fnote">ทรงกลม = (4/3)πr³</div><div class="fex">✏️ ทรงสี่เหลี่ยม = กว้าง×ยาว×สูง</div></div></div></div>
+  <div id="rlaw" class="rpanel"><div class="fgrid">
+    <div class="fc"><div class="ftopic lav">โครงสร้างราชการ</div><div class="fmain">ส่วนกลาง → ภูมิภาค → ท้องถิ่น</div><div class="fnote">กระทรวง → กรม → จังหวัด → อำเภอ → ตำบล</div></div>
+    <div class="fc"><div class="ftopic lav">ธรรมาภิบาล 6 หลัก</div><div class="fmain">นิติ คุณธรรม โปร่งใส มีส่วนร่วม รับผิดชอบ คุ้มค่า</div><div class="fnote">พ.ร.ฎ. ว่าด้วยหลักเกณฑ์และวิธีการบริหารกิจการบ้านเมืองที่ดี</div></div>
+    <div class="fc"><div class="ftopic sky">กฎหมายปกครอง</div><div class="fmain">คำสั่งทางปกครอง + การอุทธรณ์</div><div class="fnote">อุทธรณ์ภายใน 15 วัน / ฟ้องศาลปกครองภายใน 90 วัน</div></div>
+    <div class="fc"><div class="ftopic sky">ละเมิด</div><div class="fmain">จงใจ/ประมาท → เสียหาย → ชดใช้</div><div class="fnote">หน่วยงานรับผิดแทนเจ้าหน้าที่ก่อน แล้วไล่เบี้ยทีหลัง</div></div>
+    <div class="fc"><div class="ftopic mint">จริยธรรม</div><div class="fmain">มาตรฐานทางจริยธรรม 7 ประการ</div><div class="fnote">ยึดประโยชน์ส่วนรวม / ซื่อสัตย์สุจริต / มีความรับผิดชอบ / โปร่งใส / คุ้มค่า / ไม่เลือกปฏิบัติ / ดำรงตน</div></div>
+    <div class="fc"><div class="ftopic pink">กฎหมายอาญา</div><div class="fmain">โทษ: ประหาร/จำคุก/กักขัง/ปรับ/ริบ</div><div class="fnote">เจตนา = รู้+ประสงค์ผล | ประมาท = ไม่ระมัดระวังเพียงพอ</div></div>
+  </div></div>
+  <div id="reng" class="rpanel"><div class="fgrid">
+    <div class="fc"><div class="ftopic mint">Tenses หลัก</div><div class="fmain">Present Simple: V / V+s/es</div><div class="fnote">Past Simple: V+ed | Future: will+V | Present Perfect: have/has+V3</div></div>
+    <div class="fc"><div class="ftopic mint">Subject-Verb</div><div class="fmain">He/She/It → V+s (Present)</div><div class="fnote">I/You/We/They → V ปกติ | Everyone/Each/Either → V+s</div></div>
+    <div class="fc"><div class="ftopic sky">Conjunctions</div><div class="fmain">Although/Even though = แม้ว่า</div><div class="fnote">Because = เพราะว่า | However = อย่างไรก็ตาม | Therefore = ดังนั้น | Unless = ยกเว้น</div></div>
+    <div class="fc"><div class="ftopic sky">Prepositions</div><div class="fmain">at (จุด) / in (พื้นที่) / on (ผิว)</div><div class="fnote">at 9am / in January / in Bangkok / on Monday / on the table</div></div>
+    <div class="fc"><div class="ftopic peach">Idioms ที่ออกบ่อย</div><div class="fmain">Break a leg = ขอให้โชคดี</div><div class="fnote">Hit the nail on the head = ถูกต้องแม่นยำ | Under the weather = ไม่สบาย | Piece of cake = ง่ายมาก</div></div>
+    <div class="fc"><div class="ftopic peach">Reading Tips</div><div class="fmain">อ่าน Question ก่อน → Scan หา keyword</div><div class="fnote">ไม่ต้องแปลทุกคำ / จับ topic sentence / ดู signal words: but, however, although</div></div>
+  </div></div>
+  <div id="rtip" class="rpanel"><div class="tiplist">
+    <div class="tipc tmath"><div class="tipbadge">คณิตศาสตร์</div><div class="tiptitle">เทคนิคทำโจทย์เร็ว</div><div class="tipbody"><ul>
+      <li>อนุกรม → <span class="hl">ดูผลต่าง</span> 2-3 ตัวแรกก่อน</li>
+      <li>ร้อยละ → <span class="hl">แทนค่า 100</span> แล้วคิดต่อ</li>
+      <li>โจทย์อายุ → <span class="hl">ตั้ง x = อายุปัจจุบัน</span> เสมอ</li>
+      <li>ตาราง → อ่าน <span class="hl">หัวตาราง</span> ก่อน แล้วค่อยดูโจทย์</li>
+      <li>ไม่แน่ใจ → <span class="hl">ตัดตัวเลือกที่ผิดชัดออก</span> แล้วเดา</li>
+    </ul></div></div>
+    <div class="tipc tlogic"><div class="tipbadge">เงื่อนไขสัญลักษณ์</div><div class="tiptitle">วิธีแก้เงื่อนไขสัญลักษณ์</div><div class="tipbody"><ul>
+      <li>อ่านเงื่อนไขให้ครบก่อน <span class="hl">อย่าเพิ่งตัดสิน</span></li>
+      <li>วาดตาราง 2×2 หรือ Venn diagram ช่วย</li>
+      <li>เงื่อนไข "ถ้า A แล้ว B" ≠ "ถ้า B แล้ว A"</li>
+      <li><span class="hl">ระวัง "บางส่วน" vs "ทั้งหมด"</span></li>
+      <li>ฝึกทำ 20 ข้อ/วัน จับเวลาด้วย</li>
+    </ul></div></div>
+    <div class="tipc tlaw"><div class="tipbadge">กฎหมาย</div><div class="tiptitle">จำกฎหมายให้ได้คะแนน</div><div class="tipbody"><ul>
+      <li>จำ <span class="hl">ชื่อกฎหมาย + ปี พ.ศ.</span> ที่ออกบ่อย</li>
+      <li>โครงสร้างราชการ → วาด Mind Map ไว้</li>
+      <li>ทำ 200 ข้อ พี่แมงปอ → จด keyword ที่ผิด</li>
+      <li><span class="hl">จริยธรรม 7 ข้อ</span> ท่องให้ขึ้นใจ</li>
+      <li>อุทธรณ์ 15 วัน / ฟ้องศาล 90 วัน</li>
+    </ul></div></div>
+    <div class="tipc teng"><div class="tipbadge">ภาษาอังกฤษ</div><div class="tiptitle">เทคนิคทำข้อสอบภาษาอังกฤษ</div><div class="tipbody"><ul>
+      <li>Grammar → <span class="hl">ดู Subject ก่อน</span> แล้วเลือก Verb</li>
+      <li>Reading → <span class="hl">อ่าน Question ก่อน Passage</span></li>
+      <li>Vocab → ดู context รอบๆ คำ ช่วยเดาความหมาย</li>
+      <li>บทสนทนา → จำ <span class="hl">สถานการณ์ + response</span> ที่เหมาะสม</li>
+      <li>ท่องผลึก 30 คำ ทุกวัน → ฟังเสียง + ความหมาย</li>
+    </ul></div></div>
+  </div></div></div>
+  <nav class="tabbar">
+    <button class="tbtn active" onclick="go('calendar',this)"><span class="ti">📅</span><span class="tl">ตาราง</span></button>
+    <button class="tbtn" onclick="go('todo',this)"><span class="ti">✅</span><span class="tl">To-Do</span></button>
+    <button class="tbtn" onclick="go('progress',this)"><span class="ti">📊</span><span class="tl">Progress</span></button>
+    <button class="tbtn" onclick="go('countdown',this)"><span class="ti">⏳</span><span class="tl">Countdown</span></button>
+    <button class="tbtn" onclick="go('timer',this)"><span class="ti">⏱️</span><span class="tl">Mock Timer</span></button>
+    <button class="tbtn" onclick="go('recap',this)"><span class="ti">📝</span><span class="tl">สูตร</span></button>
+  </nav>
+</div>
+<script>
+var BAKED_ST=/*BAKED_ST_START*/{"cal-4-morning-0":true,"cal-4-morning-1":true,"cal-4-morning-2":true}/*BAKED_ST_END*/;
+var BAKED_LOGS=/*BAKED_LOGS_START*/[]/*BAKED_LOGS_END*/;
+var BAKED_TAB=/*BAKED_TAB_START*/'calendar'/*BAKED_TAB_END*/;
+let _memST=JSON.parse(JSON.stringify(BAKED_ST));
+let _memLogs=JSON.parse(JSON.stringify(BAKED_LOGS));
+let _memTab=BAKED_TAB;
+function getKey(k){return _memST[k]===true;}
+function setKey(k,v){_memST[k]=v;}
+
+const ROWS=[
+  {date:'4',mon:'มี.ค.',dc:'pink',morning:{t:'อนุกรมพิเศษ + Operation',s:['อนุกรมเลขคณิต/เรขาคณิต','อนุกรมพิเศษ/ผสม','การบวก ลบ คูณ หาร']},afternoon:{t:'พี่ขิม: อนุกรม ก.พ. ปูพื้น',s:['ดูคลิปพี่ขิม','จดสูตรและเทคนิค','ทำโจทย์ตามคลิป']},evening:{t:'โจทย์ Operation 20 ข้อ',s:['ทำโจทย์ 20 ข้อ','เช็คคำตอบ','จดจุดที่ผิด']}},
+  {date:'5',mon:'มี.ค.',dc:'mint',morning:{t:'เลขพื้นฐาน + ห.ร.ม./ค.ร.น.',s:['ห.ร.ม.','ค.ร.น.','ตัวหาร/ตัวคูณร่วม']},afternoon:{t:'พี่แมงปอ: เคล็ดลับมือใหม่',s:['ดูคลิปพี่แมงปอ','จดเทคนิคลัด']},evening:{t:'โจทย์เลขพื้นฐาน 20 ข้อ',s:['ทำโจทย์ 20 ข้อ','จด Pic Recap']}},
+  {date:'6',mon:'มี.ค.',dc:'lavender',morning:{t:'อัตราส่วน + ของผสม',s:['อัตราส่วนอย่างง่าย','อัตราส่วนผสม','การผสมสาร']},afternoon:{t:'พี่ขิม: รวมข้อสอบปี 63–64',s:['ทำข้อสอบจริง 63–64','เช็คเฉลยและวิเคราะห์']},evening:{t:'ทบทวนสูตรของผสม',s:['สรุปสูตรของผสม','ทำโจทย์เพิ่ม 10 ข้อ']}},
+  {date:'7',mon:'มี.ค.',dc:'peach',morning:{t:'ร้อยละ + กำไรขาดทุน',s:['ร้อยละ/เปอร์เซ็นต์','กำไร-ขาดทุน','ส่วนลด/ราคาขาย']},afternoon:{t:'พี่แมงปอ: สรุปกฎหมายอาญา',s:['ดูคลิปกฎหมายอาญา','จดหลักกฎหมายสำคัญ','ทำโจทย์']},evening:{t:'โจทย์ร้อยละ 30 ข้อ',s:['ทำโจทย์ร้อยละ 20 ข้อ','ทำโจทย์กำไร-ขาดทุน 10 ข้อ']}},
+  {date:'8',mon:'มี.ค.',dc:'sky',morning:{t:'ดอกเบี้ย + ร้อยละการเปลี่ยน',s:['ดอกเบี้ยอย่างง่าย','ดอกเบี้ยทบต้น','อัตราการเปลี่ยนแปลง']},afternoon:{t:'พี่น้อต: สรุปกฎหมาย ภาค ก.',s:['ดูคลิปพี่น้อต','สรุปกฎหมายภาค ก.','จด Mind Map']},evening:{t:'สรุป Week 1',s:['ทบทวนคณิต Week 1','ทบทวนกฎหมาย Week 1','จด Pic Recap']}},
+  {date:'9',mon:'มี.ค.',dc:'yellow',morning:{t:'สมการ 1 + 2 ตัวแปร',s:['สมการเชิงเส้น 1 ตัวแปร','สมการ 2 ตัวแปร','โจทย์อายุ/งาน/อัตราเร็ว']},afternoon:{t:'พี่ขิม: พื้นฐานคณิตเปลี่ยนชีวิต',s:['ดูคลิปพี่ขิม','จดเทคนิคสำคัญ']},evening:{t:'โจทย์สมการ 20 ข้อ',s:['ทำโจทย์สมการ 20 ข้อ','เน้นโจทย์อายุ 10 ข้อ']}},
+  {date:'10',mon:'มี.ค.',dc:'pink',morning:{t:'พื้นที่และปริมาตร',s:['พื้นที่รูปทรง 2 มิติ','ปริมาตรรูปทรง 3 มิติ','พื้นที่ผิว']},afternoon:{t:'พี่ขิม: เฉลยข้อสอบ ก.พ. 66',s:['ดูเฉลยข้อสอบจริง','วิเคราะห์จุดอ่อน']},evening:{t:'โจทย์พื้นที่/ปริมาตร',s:['ทำโจทย์พื้นที่ 15 ข้อ','ทำโจทย์ปริมาตร 10 ข้อ']}},
+  {date:'11',mon:'มี.ค.',dc:'mint',morning:{t:'สถิติ: Mean / Median / Mode',s:['Mean / Median / Mode','การกระจาย/ส่วนเบี่ยงเบน']},afternoon:{t:'พี่ขิม: สูตรลับคณิตราชการ',s:['ดูคลิปสูตรลับ','จดสูตรทั้งหมด']},evening:{t:'โจทย์สถิติ 20 ข้อ',s:['ทำโจทย์สถิติ 20 ข้อ']}},
+  {date:'12',mon:'มี.ค.',dc:'lavender',morning:{t:'ตารางข้อมูล + กราฟ',s:['อ่านตารางข้อมูล','วิเคราะห์กราฟ','เปรียบเทียบข้อมูล']},afternoon:{t:'พี่ขิม: ติววิเคราะห์ตาราง',s:['ดูคลิปวิเคราะห์ตาราง','ทำโจทย์ตามคลิป']},evening:{t:'โจทย์ตาราง 20 ข้อ',s:['ทำโจทย์ตาราง 20 ข้อ','ฝึกจับเวลา']}},
+  {date:'13',mon:'มี.ค.',dc:'peach',morning:{t:'พิมพ์บัตรสอบ + เงื่อนไขสัญลักษณ์',s:['พิมพ์บัตรสอบ ✅','เงื่อนไขสัญลักษณ์พื้นฐาน','เงื่อนไขผสม']},afternoon:{t:'พี่แมงปอ: วาร์ป 200 ข้อ',s:['ทำข้อสอบ 200 ข้อ ส่วนที่ 1','จดข้อที่ผิด']},evening:{t:'โจทย์เงื่อนไขสัญลักษณ์',s:['ทำโจทย์ 20 ข้อ','ทบทวนจุดที่ผิด']}},
+  {date:'14',mon:'มี.ค.',dc:'sky',morning:{t:'เงื่อนไขสัญลักษณ์ (ยาก)',s:['เงื่อนไขซับซ้อน','โจทย์ระดับยาก','เทคนิคแก้โจทย์เร็ว']},afternoon:{t:'พี่แมงปอ: 30 ผลึกอังกฤษ (1-10)',s:['ศัพท์ผลึก 1-10','จำ Vocab 10 คำ','ทำแบบฝึกหัด']},evening:{t:'ทวนศัพท์อังกฤษ',s:['ทบทวน Vocab วันนี้','ฝึกใช้ศัพท์ในประโยค']}},
+  {date:'15',mon:'มี.ค.',dc:'yellow',morning:{t:'เงื่อนไขภาษา',s:['เงื่อนไขภาษาพื้นฐาน','การตีความเงื่อนไข','โจทย์จากข้อสอบจริง']},afternoon:{t:'พี่ขิม: เงื่อนไขภาษา (ข้อสอบจริง)',s:['ดูคลิปเงื่อนไขภาษา','ทำโจทย์ข้อสอบจริง','วิเคราะห์เฉลย']},evening:{t:'โจทย์เงื่อนไขภาษา 20 ข้อ',s:['ทำโจทย์ 20 ข้อ','ฝึกจับเวลา']}},
+  {date:'16',mon:'มี.ค.',dc:'pink',morning:{t:'อุปมาอุปไมย (บทที่ 30–31)',s:['ความสัมพันธ์ของคำ','อุปมาอุปไมยประเภทต่างๆ','โจทย์บทที่ 30-31']},afternoon:{t:'พี่ขิม: ติวอุปมาอุปไมย',s:['ดูคลิปพี่ขิม','จดเทคนิค']},evening:{t:'โจทย์อุปมาอุปไมย 20 ข้อ',s:['ทำโจทย์ 20 ข้อ']}},
+  {date:'17',mon:'มี.ค.',dc:'mint',morning:{t:'อุปมาอุปไมย (บทที่ 32–33)',s:['โจทย์บทที่ 32-33','โจทย์ระดับยาก','ทบทวนรูปแบบที่ออกสอบ']},afternoon:{t:'พี่น้อต: ติวภาษาไทย ภาค ก.',s:['ดูคลิปพี่น้อต','จดเทคนิค']},evening:{t:'ฝึกคู่คำไทย 20 คู่',s:['ท่องคู่คำไทย 20 คู่','ทำโจทย์คู่คำ']}},
+  {date:'18',mon:'มี.ค.',dc:'lavender',morning:{t:'การเรียงประโยค (บทที่ 34–35)',s:['หลักการเรียงประโยค','ประโยคเชื่อม/ลำดับเหตุการณ์','โจทย์บทที่ 34-35']},afternoon:{t:'พี่ขิม: การเรียงประโยค ก.พ.',s:['ดูคลิปพี่ขิม','ทำโจทย์ตามคลิป']},evening:{t:'โจทย์เรียงประโยค 20 ข้อ',s:['ทำโจทย์ 20 ข้อ','ฝึกจับเวลา']}},
+  {date:'19',mon:'มี.ค.',dc:'peach',morning:{t:'บทความสั้น/ยาว (บทที่ 36–37)',s:['เทคนิคอ่านบทความเร็ว','จับใจความสำคัญ','โจทย์บทที่ 36-37']},afternoon:{t:'พี่ขิม: ตีความบทความ (คลิปแดง)',s:['ดูคลิปแดงพี่ขิม','จดเทคนิคตีความ']},evening:{t:'ฝึกอ่านบทความ 3 เรื่อง',s:['อ่านบทความ 3 เรื่อง','ทำโจทย์ตีความ']}},
+  {date:'20',mon:'มี.ค.',dc:'sky',morning:{t:'บทความสถิติ (บทที่ 38–39)',s:['อ่านบทความที่มีตาราง/กราฟ','วิเคราะห์ข้อมูลเชิงสถิติ','โจทย์บทที่ 38-39']},afternoon:{t:'พี่แมงปอ: 30 ผลึกอังกฤษ (11-20)',s:['ศัพท์ผลึก 11-20','จำ Vocab 10 คำ','ทำแบบฝึกหัด']},evening:{t:'โจทย์ Reading 15 ข้อ',s:['ทำโจทย์ Reading 15 ข้อ','ทบทวน Vocab']}},
+  {date:'21',mon:'มี.ค.',dc:'yellow',morning:{t:'ภาษาอังกฤษ Grammar (บทที่ 40)',s:['Tense ต่างๆ','Subject-Verb Agreement','Conjunctions/Prepositions']},afternoon:{t:'พี่แมงปอ: 30 ผลึกอังกฤษ (21-30)',s:['ศัพท์ผลึก 21-30','จำ Vocab 10 คำ','ทำแบบฝึกหัด']},evening:{t:'โจทย์ Grammar 20 ข้อ',s:['ทำโจทย์ Grammar 20 ข้อ']}},
+  {date:'22',mon:'มี.ค.',dc:'pink',morning:{t:'ภาษาอังกฤษ Conversation (41-42)',s:['บทสนทนาสถานการณ์ต่างๆ','Idioms/Fixed expressions','โจทย์บทที่ 41-42']},afternoon:{t:'พี่ขิม: ติวภาษาอังกฤษ',s:['ดูคลิปพี่ขิม','จดเทคนิค']},evening:{t:'ฝึกบทสนทนา 10 บท',s:['ฝึกบทสนทนา 10 บท','ทำโจทย์ Conversation']}},
+  {date:'23',mon:'มี.ค.',dc:'mint',morning:{t:'กฎหมายบริหารราชการแผ่นดิน',s:['ราชการส่วนกลาง/ภูมิภาค/ท้องถิ่น','พ.ร.บ. ระเบียบบริหารราชการแผ่นดิน']},afternoon:{t:'พี่แมงปอ: 200 ข้อ บริหารราชการ',s:['ทำ 200 ข้อ บริหารราชการ','จดข้อที่ผิด']},evening:{t:'สรุปแผนผังโครงสร้าง',s:['วาด Mind Map โครงสร้าง','ทบทวนจุดสำคัญ']}},
+  {date:'24',mon:'มี.ค.',dc:'lavender',morning:{t:'กฎหมายปกครอง + ละเมิด',s:['หลักกฎหมายปกครอง','ความรับผิดทางละเมิด','คดีปกครอง']},afternoon:{t:'พี่แมงปอ: 200 ข้อ ปกครอง/ละเมิด',s:['ทำ 200 ข้อ ปกครอง/ละเมิด','จดข้อที่ผิด']},evening:{t:'สรุปเรื่องอุทธรณ์',s:['สรุปขั้นตอนอุทธรณ์','ทบทวนจุดสำคัญ']}},
+  {date:'25',mon:'มี.ค.',dc:'peach',morning:{t:'กฎหมายบ้านเมืองที่ดี',s:['หลักธรรมาภิบาล','พ.ร.ฎ. หลักเกณฑ์บ้านเมืองที่ดี','ตัวชี้วัดและแนวทางปฏิบัติ']},afternoon:{t:'พี่แมงปอ: 200 ข้อ บ้านเมืองที่ดี',s:['ทำ 200 ข้อ บ้านเมืองที่ดี','จดข้อที่ผิด']},evening:{t:'จด Keyword กฎหมาย',s:['จด Keyword กฎหมาย','ทบทวน']}},
+  {date:'26',mon:'มี.ค.',dc:'sky',morning:{t:'มาตรฐานจริยธรรม + กฎหมายอาญา',s:['มาตรฐานจริยธรรมข้าราชการ','ประมวลจริยธรรม','กฎหมายอาญาที่เกี่ยวข้อง']},afternoon:{t:'พี่แมงปอ: 200 ข้อ จริยธรรม/อาญา',s:['ทำ 200 ข้อ จริยธรรม/อาญา','จดข้อที่ผิด']},evening:{t:'ทวนกฎหมายทั้งหมด',s:['ทบทวนกฎหมายทั้งหมด','จัดลำดับความสำคัญ']}},
+  {date:'27',mon:'มี.ค.',dc:'yellow',morning:{t:'ตะลุยโจทย์ผสมทุกวิชา',s:['ทำโจทย์คณิตผสม','ทำโจทย์ภาษาผสม','ทำโจทย์กฎหมายผสม']},afternoon:{t:'พี่น้อต: ติวโค้งสุดท้าย ภาค ก.',s:['ดูคลิปโค้งสุดท้าย','จดเทคนิคสำคัญ']},evening:{t:'รวมจุดที่มักพลาด',s:['รวบรวมจุดผิดทั้งหมด','วางแผนทบทวน']}},
+  {date:'28',mon:'มี.ค.',dc:'pink',morning:{t:'Mock Test #1 (จับเวลา)',s:['ทำ Mock Test #1 เต็มชุด','จับเวลาเหมือนสอบจริง']},afternoon:{t:'เฉลยละเอียด + วิเคราะห์จุดอ่อน',s:['เช็คเฉลยทุกข้อ','วิเคราะห์จุดอ่อนหลัก']},evening:{t:'จด Pic Recap Mock #1',s:['จด Pic Recap Mock #1','วางแผนแก้ไข']}},
+  {date:'29',mon:'มี.ค.',dc:'mint',morning:{t:'Mock Test #2 (จับเวลา)',s:['ทำ Mock Test #2 เต็มชุด','จับเวลาเหมือนสอบจริง']},afternoon:{t:'เฉลยละเอียด + เก็บตก',s:['เช็คเฉลยทุกข้อ','เก็บตกจุดผิด Mock #1–#2']},evening:{t:'จด Pic Recap Mock #2',s:['จด Pic Recap Mock #2','ทบทวนสูตรสำคัญ']}},
+  {date:'30',mon:'มี.ค.',dc:'lavender',morning:{t:'ทบทวน Pic Recap ทั้งหมด',s:['อ่าน Pic Recap ทุกอัน','ทบทวนสูตร/หลักการสำคัญ']},afternoon:{t:'พี่ขิม: สูตรลับคณิต (รอบ 2)',s:['ดูคลิปสูตรลับรอบ 2','จดเพิ่มเติม']},evening:{t:'เตรียมอุปกรณ์สอบ',s:['เตรียมบัตรสอบ/บัตรประชาชน','เตรียมเครื่องเขียน']}},
+  {date:'31 🎯',mon:'มี.ค.',dc:'peach',morning:{t:'อ่านสรุป 1 หน้า (เบาๆ)',s:['อ่านสรุปคณิต','อ่านสรุปกฎหมาย','อ่านสรุปอังกฤษ']},afternoon:{t:'พักผ่อน / จัดกระเป๋า',s:['จัดกระเป๋าให้เรียบร้อย','พักผ่อนเต็มที่']},evening:{t:'เข้านอนหัวค่ำ 💤',s:['งดโทรศัพท์','นอนไม่เกิน 22:00 น.']}},
+];
+const DC_COLORS={pink:{bg:'#f9d5e0',fg:'#d9638a'},mint:{bg:'#d4f0e8',fg:'#3aaa8c'},lavender:{bg:'#e8dff5',fg:'#7050b0'},peach:{bg:'#fde8d0',fg:'#d87030'},sky:{bg:'#d5eaf9',fg:'#3a88c8'},yellow:{bg:'#fff8d0',fg:'#b89a10'}};
+const SLOTS=['morning','afternoon','evening'];
+const SLOT_META={morning:{lbl:'☀️ 08:00 – 12:00',sub:'(พี่บัส)'},afternoon:{lbl:'🌤 13:00 – 16:00',sub:'(พี่ขิม/น้อต/แมงปอ)'},evening:{lbl:'🌙 20:00 – 21:00',sub:'(ทบทวน)'}};
+const TODO_DATA=[
+  {id:'math',label:'🔢 คณิตศาสตร์',sections:[
+    {title:'เลขและการดำเนินการ',col:'pink',items:['อนุกรมเลขคณิต','อนุกรมเรขาคณิต','อนุกรมพิเศษ/ผสม','Operation','ห.ร.ม. และ ค.ร.น.','อัตราส่วนและสัดส่วน','ของผสมและสารละลาย']},
+    {title:'ร้อยละและดอกเบี้ย',col:'peach',items:['ร้อยละ/เปอร์เซ็นต์','กำไร-ขาดทุน','ส่วนลด/ราคาขาย','ดอกเบี้ยอย่างง่าย','ดอกเบี้ยทบต้น']},
+    {title:'สมการและพีชคณิต',col:'lavender',items:['สมการเชิงเส้น 1 ตัวแปร','สมการ 2 ตัวแปร','โจทย์อายุ','โจทย์งานและอัตราเร็ว']},
+    {title:'เรขาคณิตและสถิติ',col:'sky',items:['พื้นที่รูปทรง 2 มิติ','ปริมาตรรูปทรง 3 มิติ','Mean / Median / Mode','วิเคราะห์ตารางข้อมูล']},
+    {title:'ตรรกะและเงื่อนไข',col:'mint',items:['เงื่อนไขสัญลักษณ์พื้นฐาน','เงื่อนไขสัญลักษณ์ผสม','เงื่อนไขภาษา','อุปมาอุปไมย']},
+  ]},
+  {id:'law',label:'⚖️ กฎหมาย',sections:[
+    {title:'กฎหมายพื้นฐาน',col:'lavender',items:['กฎหมายอาญาที่เกี่ยวข้อง','หลักธรรมาภิบาล','มาตรฐานจริยธรรม','ประมวลจริยธรรม']},
+    {title:'การบริหารราชการ',col:'sky',items:['ราชการส่วนกลาง','ราชการส่วนภูมิภาค','ราชการส่วนท้องถิ่น','พ.ร.บ. ระเบียบบริหารราชการแผ่นดิน']},
+    {title:'กฎหมายปกครอง',col:'pink',items:['หลักกฎหมายปกครอง','ความรับผิดทางละเมิด','คดีปกครอง','ขั้นตอนอุทธรณ์']},
+    {title:'ข้อสอบรวม 200 ข้อ',col:'mint',items:['บริหารราชการแผ่นดิน','ปกครอง/ละเมิด','บ้านเมืองที่ดี','จริยธรรม/อาญา']},
+  ]},
+  {id:'eng',label:'🇬🇧 ภาษาอังกฤษ',sections:[
+    {title:'คำศัพท์ 30 ผลึก',col:'mint',items:['ผลึกอังกฤษ 1-10','ผลึกอังกฤษ 11-20','ผลึกอังกฤษ 21-30']},
+    {title:'Grammar',col:'sky',items:['Tense ต่างๆ','Subject-Verb Agreement','Conjunctions','Prepositions','Articles']},
+    {title:'Reading & Conversation',col:'peach',items:['บทสนทนาสถานการณ์ต่างๆ','Idioms/Fixed expressions','อ่านบทความภาษาอังกฤษ','ตีความบทความ']},
+  ]},
+];
+function calKey(date,slot,i){return `cal-${date}-${slot}-${i}`;}
+function todoKey(id,sec,i){return `todo-${id}-${sec}-${i}`;}
+function allCalKeys(){return ROWS.flatMap(r=>SLOTS.flatMap(s=>r[s].s.map((_,i)=>calKey(r.date,s,i))));}
+function allTodoKeys(){return TODO_DATA.flatMap(c=>c.sections.flatMap(s=>s.items.map((_,i)=>todoKey(c.id,s.title,i))));}
+function allKeys(){return [...allCalKeys(),...allTodoKeys()];}
+function doneCount(){return allKeys().filter(k=>getKey(k)).length;}
+function updateGlobalBar(){
+  const total=allKeys().length,done=doneCount(),pct=total?Math.round(done/total*100):0;
+  document.getElementById('mpb').style.width=pct+'%';
+  document.getElementById('mpt').textContent=`✅ ${done} / ${total} รายการ`;
+  document.getElementById('mpp').textContent=pct+'%';
+}
+function go(name,btn){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.tbtn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('page-'+name).classList.add('active');
+  btn.classList.add('active');
+  _memTab=name;
+  if(name==='progress')buildProgress();
+  if(name==='countdown')startCountdown();
+}
+function buildCalendar(){
+  const pg=document.getElementById('page-calendar');
+  pg.innerHTML='<div class="sectitle">📅 ตารางรายวัน <span class="pill">4 มี.ค. – 5 ก.ค. 2569</span></div><div class="cal-grid" id="cg"></div>';
+  const cg=document.getElementById('cg');
+  ROWS.forEach((row,ri)=>{
+    const card=document.createElement('div');
+    card.className=`dcard dc-${row.dc}`;card.id='dc'+ri;
+    const dayKeys=SLOTS.flatMap(s=>row[s].s.map((_,i)=>calKey(row.date,s,i)));
+    const pct=calcPct(dayKeys);const c=DC_COLORS[row.dc]||DC_COLORS.pink;
+    card.innerHTML=`<div class="dhdr" onclick="toggleDay(${ri})">
+      <div class="dbox" style="background:${c.bg};color:${c.fg}"><span class="dn">${row.date.replace(' 🎯','')}</span><span class="dm">${row.mon}</span></div>
+      <div class="dinfo"><div class="dtitle">${row.morning.t}</div><div class="dsub">${row.afternoon.t}</div></div>
+      <div class="dprog" id="dp${ri}" style="background:${c.bg};color:${c.fg}">${pct}%</div>
+      <div class="dchev">›</div></div>
+      <div class="dslots" id="ds${ri}"></div>`;
+    cg.appendChild(card);
+    const ds=document.getElementById('ds'+ri);
+    SLOTS.forEach(s=>{
+      const cell=row[s];const sc=document.createElement('div');sc.className='scard '+s;
+      const meta=SLOT_META[s];
+      let h=`<div class="stime">${meta.lbl} ${meta.sub}</div><div class="stitle">${cell.t}</div>`;
+      cell.s.forEach((task,i)=>{
+        const k=calKey(row.date,s,i);const on=getKey(k);
+        h+=`<div class="task"><div class="chk${on?' on':''}" id="chk-${k}" onclick="toggleCal('${k}',${ri})">${on?'✓':''}</div><span class="tlabel${on?' on':''}" id="lbl-${k}">${task}</span></div>`;
+      });
+      sc.innerHTML=h;ds.appendChild(sc);
+    });
+  });
+}
+function calcPct(keys){const d=keys.filter(k=>getKey(k)).length;return keys.length?Math.round(d/keys.length*100):0;}
+function toggleDay(ri){document.getElementById('dc'+ri).classList.toggle('open');}
+function toggleCal(k,ri){
+  const v=!getKey(k);setKey(k,v);
+  const chk=document.getElementById('chk-'+k);const lbl=document.getElementById('lbl-'+k);
+  if(chk){chk.classList.toggle('on',v);chk.textContent=v?'✓':'';}
+  if(lbl)lbl.classList.toggle('on',v);
+  const row=ROWS[ri];
+  const dayKeys=SLOTS.flatMap(s=>row[s].s.map((_,i)=>calKey(row.date,s,i)));
+  const dp=document.getElementById('dp'+ri);if(dp)dp.textContent=calcPct(dayKeys)+'%';
+  updateGlobalBar();
+}
+function buildTodo(){
+  const pg=document.getElementById('page-todo');
+  pg.innerHTML='<div class="sectitle">✅ To-Do แยกวิชา <span class="pill">เช็คความคืบหน้า</span></div>';
+  const bar=document.createElement('div');bar.className='subjbar';
+  TODO_DATA.forEach((cat,ci)=>{
+    const btn=document.createElement('button');btn.className='stab'+(ci===0?' active':'');
+    btn.dataset.s=cat.id;btn.textContent=cat.label;
+    btn.onclick=()=>{
+      document.querySelectorAll('.stab').forEach(b=>b.classList.remove('active'));btn.classList.add('active');
+      document.querySelectorAll('.spanel').forEach(p=>p.classList.remove('active'));document.getElementById('sp-'+cat.id).classList.add('active');
+    };
+    bar.appendChild(btn);
+  });
+  pg.appendChild(bar);
+  TODO_DATA.forEach((cat,ci)=>{
+    const panel=document.createElement('div');panel.className='spanel s'+cat.id+(ci===0?' active':'');panel.id='sp-'+cat.id;
+    cat.sections.forEach(sec=>{
+      const secDiv=document.createElement('div');secDiv.className='tsec';
+      const total=sec.items.length;const done=sec.items.filter((_,i)=>getKey(todoKey(cat.id,sec.title,i))).length;
+      secDiv.innerHTML=`<div class="tsectitle ${sec.col}">${sec.title}</div><div class="tdone-lbl" id="tdl-${cat.id}-${sec.title.replace(/\s/g,'')}">${done}/${total} เสร็จแล้ว</div>`;
+      sec.items.forEach((item,i)=>{
+        const k=todoKey(cat.id,sec.title,i);const on=getKey(k);
+        const div=document.createElement('div');div.className='titem';
+        div.innerHTML=`<div class="tchk${on?' on':''}" id="tc-${k}" onclick="toggleTodo('${k}','${cat.id}','${sec.title}',${total})">${on?'✓':''}</div><span class="ttext${on?' on':''}" id="tt-${k}">${item}</span>`;
+        secDiv.appendChild(div);
+      });
+      panel.appendChild(secDiv);
+    });
+    pg.appendChild(panel);
+  });
+}
+function toggleTodo(k,catId,secTitle,total){
+  const v=!getKey(k);setKey(k,v);
+  const tc=document.getElementById('tc-'+k);const tt=document.getElementById('tt-'+k);
+  if(tc){tc.classList.toggle('on',v);tc.textContent=v?'✓':'';}
+  if(tt)tt.classList.toggle('on',v);
+  const cat=TODO_DATA.find(c=>c.id===catId);const sec=cat?.sections.find(s=>s.title===secTitle);
+  if(sec){
+    const done=sec.items.filter((_,i)=>getKey(todoKey(catId,secTitle,i))).length;
+    const lbl=document.getElementById(`tdl-${catId}-${secTitle.replace(/\s/g,'')}`);
+    if(lbl)lbl.textContent=`${done}/${total} เสร็จแล้ว`;
+  }
+  updateGlobalBar();
+}
+function buildProgress(){
+  const pg=document.getElementById('page-progress');
+  pg.innerHTML='<div class="sectitle">📊 Progress ความคืบหน้า <span class="pill">ทุกวิชา</span></div>';
+  const total=allKeys().length,done=doneCount(),pct=total?Math.round(done/total*100):0;
+  const r=40,circ=2*Math.PI*r,dash=circ*pct/100;
+  const ov=document.createElement('div');ov.className='prog-overall';
+  ov.innerHTML=`<div class="pring-wrap"><svg width="90" height="90" viewBox="0 0 90 90">
+    <circle cx="45" cy="45" r="${r}" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="9"/>
+    <circle cx="45" cy="45" r="${r}" fill="none" stroke="#f0a8bb" stroke-width="9" stroke-dasharray="${dash.toFixed(1)} ${circ.toFixed(1)}" stroke-linecap="round"/></svg>
+    <div class="pring-txt"><div class="pring-pct">${pct}%</div><div class="pring-lbl">สำเร็จ</div></div></div>
+    <div class="pov-info"><h2>ภาพรวมทั้งหมด</h2><p>รายการที่ทำเสร็จแล้ว</p><div class="pov-counts">${done}<span style="font-size:16px;opacity:.6"> / ${total}</span></div></div>`;
+  pg.appendChild(ov);
+  const cards=document.createElement('div');cards.className='pcards';
+  ['cp','cl','cm'].forEach((cls,idx)=>{
+    const cat=TODO_DATA[idx];let ctotal=0,cdone=0;
+    const secStats=cat.sections.map(sec=>{
+      const t=sec.items.length,d=sec.items.filter((_,i)=>getKey(todoKey(cat.id,sec.title,i))).length;
+      ctotal+=t;cdone+=d;return{title:sec.title,t,d};
+    });
+    const cpct=ctotal?Math.round(cdone/ctotal*100):0;
+    const card=document.createElement('div');card.className='pcard '+cls;
+    let rows=secStats.map(s=>{const sp=s.t?Math.round(s.d/s.t*100):0;
+      return `<div class="psrow"><div class="psname">${s.title}</div><div class="psmini-w"><div class="psmini" style="width:${sp}%"></div></div><div class="psval">${s.d}/${s.t}</div></div>`;
+    }).join('');
+    card.innerHTML=`<div class="pcard-hdr"><div class="pcard-title">${cat.label}</div><div class="pcard-pct">${cpct}%</div></div>
+      <div class="pbar-wrap"><div class="pbar-fill" style="width:${cpct}%"></div></div><div>${rows}</div>`;
+    cards.appendChild(card);
+  });
+  pg.appendChild(cards);
+}
+let cdInt=null;
+function buildCountdown(){
+  const pg=document.getElementById('page-countdown');
+  pg.innerHTML=`<div class="sectitle">⏳ Countdown สอบ ก.พ. <span class="pill">2569</span></div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-bottom:16px">
+    <div class="cd-hero" style="margin-bottom:0"><div class="cd-pre">🖥️ อิเล็กทรอนิกส์</div><div class="cd-ttl">สอบ ก.พ. ภาค ก. 2569</div><div class="cd-dstr">วันเสาร์ที่ 23 พฤษภาคม 2569</div>
+      <div class="cd-nums">
+        <div class="cdu ud"><div class="cdn" id="cdd">--</div><div class="cdul">วัน</div></div>
+        <div class="cdu uh"><div class="cdn" id="cdh">--</div><div class="cdul">ชั่วโมง</div></div>
+        <div class="cdu um"><div class="cdn" id="cdm">--</div><div class="cdul">นาที</div></div>
+        <div class="cdu us"><div class="cdn" id="cds">--</div><div class="cdul">วินาที</div></div>
+      </div></div>
+    <div class="cd-hero" style="margin-bottom:0;background:linear-gradient(135deg,#d4f0e8 0%,#d5eaf9 50%,#e8dff5 100%)">
+      <div class="cd-pre">📝 เปเปอร์</div><div class="cd-ttl">สอบ ก.พ. ภาค ก. 2569</div><div class="cd-dstr">วันอาทิตย์ที่ 5 กรกฎาคม 2569</div>
+      <div class="cd-nums">
+        <div class="cdu ud"><div class="cdn" id="cdd2">--</div><div class="cdul">วัน</div></div>
+        <div class="cdu uh"><div class="cdn" id="cdh2">--</div><div class="cdul">ชั่วโมง</div></div>
+        <div class="cdu um"><div class="cdn" id="cdm2">--</div><div class="cdul">นาที</div></div>
+        <div class="cdu us"><div class="cdn" id="cds2">--</div><div class="cdul">วินาที</div></div>
+      </div></div>
+  </div>
+  <div class="sectitle" style="font-size:15px;margin-bottom:10px">📍 Milestone</div>
+  <div class="cd-ms-wrap" id="cdms"></div>`;
+  const milestones=[
+    {name:'เริ่มต้นติว ก.พ.',date:'2026-03-04',cls:'done',d:'4 มี.ค. 69'},
+    {name:'Mock Test #1',date:'2026-05-10',cls:'dpe',d:'10 พ.ค. 69'},
+    {name:'Mock Test #2',date:'2026-05-17',cls:'ds',d:'17 พ.ค. 69'},
+    {name:'วันทบทวนสุดท้าย (อิเล็กทรอนิกส์)',date:'2026-05-22',cls:'dm',d:'22 พ.ค. 69'},
+    {name:'🖥️ สอบ ก.พ. อิเล็กทรอนิกส์',date:'2026-05-23',cls:'dp',d:'23 พ.ค. 69'},
+    {name:'วันทบทวนสุดท้าย (เปเปอร์)',date:'2026-07-04',cls:'dl',d:'4 ก.ค. 69'},
+    {name:'📝 สอบ ก.พ. เปเปอร์',date:'2026-07-05',cls:'dpe',d:'5 ก.ค. 69'},
+  ];
+  const today=new Date();today.setHours(0,0,0,0);
+  const msWrap=document.getElementById('cdms');
+  milestones.forEach(ms=>{
+    const msDate=new Date(ms.date),diff=Math.round((msDate-today)/86400000);
+    let txt,cls;
+    if(diff<0){txt=`ผ่านไปแล้ว ${Math.abs(diff)} วัน`;cls='past';}
+    else if(diff===0){txt='วันนี้! 🎉';cls='today';}
+    else if(diff<=5){txt=`อีก ${diff} วัน`;cls='soon';}
+    else{txt=`อีก ${diff} วัน`;cls='far';}
+    msWrap.innerHTML+=`<div class="cdm"><div class="cdmdot ${ms.cls}"></div><div class="cdmi"><div class="cdmname">${ms.name}</div><div class="cdmd">${ms.d}</div></div><div class="cdmleft ${cls}">${txt}</div></div>`;
+  });
+}
+function startCountdown(){
+  if(cdInt)clearInterval(cdInt);
+  function tick(){
+    const now=new Date();
+    [[new Date('2026-05-23T09:00:00'),''],[ new Date('2026-07-05T09:00:00'),'2']].forEach(([exam,suf])=>{
+      const diff=exam-now;const set=(id,v)=>{const el=document.getElementById(id);if(el)el.textContent=String(v).padStart(2,'0');};
+      if(diff<=0){['d','h','m','s'].forEach(u=>set('cd'+u+suf,'00'));return;}
+      set('cdd'+suf,Math.floor(diff/86400000));set('cdh'+suf,Math.floor((diff%86400000)/3600000));
+      set('cdm'+suf,Math.floor((diff%3600000)/60000));set('cds'+suf,Math.floor((diff%60000)/1000));
+    });
+  }
+  tick();cdInt=setInterval(tick,1000);
+}
+let timerSec=0,timerTotal=0,timerRun=false,timerInt=null,currentPreset='full';
+const PRESETS={full:{name:'ข้อสอบเต็มชุด',detail:'ก.พ. ภาค ก.',secs:10800},half:{name:'ครึ่งชุด',detail:'1.5 ชั่วโมง',secs:5400},quick:{name:'Quick Drill',detail:'30 นาที',secs:1800},review:{name:'ทบทวน',detail:'20 นาที',secs:1200}};
+function buildTimer(){
+  const pg=document.getElementById('page-timer');
+  pg.innerHTML=`<div class="sectitle timer-page">⏱️ Mock Test Timer <span class="pill">จับเวลา</span></div>
+  <div class="timer-page">
+    <div class="presets" id="presets-grid"></div>
+    <div class="timer-hero">
+      <div class="tdisp" id="tdisp">03:00:00</div>
+      <div class="tsub" id="tsub">เลือกโหมดและกด เริ่ม</div>
+      <div class="tpw"><div class="tpf" id="tpf" style="width:100%"></div></div>
+      <div class="tbtns">
+        <button class="tbtn2 bt-start" onclick="timerStart()">▶ เริ่ม</button>
+        <button class="tbtn2 bt-pause" onclick="timerPause()">⏸ หยุด</button>
+        <button class="tbtn2 bt-reset" onclick="timerReset()">↺ รีเซ็ต</button>
+      </div>
+    </div>
+    <div class="mlog">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <div class="mlog-title" style="margin-bottom:0">📋 ประวัติการ Mock Test</div>
+        <button onclick="clearAllLogs()" style="font-size:11px;color:#d87030;background:#fde8d0;border:none;border-radius:8px;padding:4px 10px;cursor:pointer;font-family:Mitr,sans-serif">ลบทั้งหมด</button>
+      </div>
+      <div id="log-list"></div>
+    </div>
+  </div>`;
+  Object.entries(PRESETS).forEach(([k,p])=>{
+    const d=document.createElement('div');d.className='pset'+(k===currentPreset?' pactive':'');d.id='pset-'+k;
+    d.innerHTML=`<div class="pset-name">${p.name}</div><div class="pset-detail">${p.detail}</div><div class="pset-time">${fmtTime(p.secs)}</div>`;
+    d.onclick=()=>{document.querySelectorAll('.pset').forEach(x=>x.classList.remove('pactive'));d.classList.add('pactive');currentPreset=k;timerReset();};
+    document.getElementById('presets-grid').appendChild(d);
+  });
+  timerReset();renderLogs();
+}
+function fmtTime(s){const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),ss=s%60;return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;}
+function timerStart(){
+  if(timerRun)return;if(timerSec<=0)timerReset();timerRun=true;
+  timerInt=setInterval(()=>{
+    timerSec--;
+    const disp=document.getElementById('tdisp');if(disp){disp.textContent=fmtTime(timerSec);disp.classList.toggle('urgent',timerSec<=300);}
+    const pf=document.getElementById('tpf');if(pf)pf.style.width=(timerTotal?Math.max(0,timerSec/timerTotal*100):0)+'%';
+    const tsub=document.getElementById('tsub');if(tsub)tsub.textContent='กำลังทำ Mock Test... สู้ๆ 💪';
+    if(timerSec<=0){clearInterval(timerInt);timerRun=false;addLog('done');}
+  },1000);
+}
+function timerPause(){if(!timerRun)return;clearInterval(timerInt);timerRun=false;addLog('pause');const tsub=document.getElementById('tsub');if(tsub)tsub.textContent='หยุดชั่วคราว';}
+function timerReset(){
+  clearInterval(timerInt);timerRun=false;timerSec=timerTotal=PRESETS[currentPreset].secs;
+  const disp=document.getElementById('tdisp');if(disp){disp.textContent=fmtTime(timerSec);disp.classList.remove('urgent');}
+  const pf=document.getElementById('tpf');if(pf)pf.style.width='100%';
+  const tsub=document.getElementById('tsub');if(tsub)tsub.textContent='เลือกโหมดและกด เริ่ม';
+}
+function fmtDate(ts){const d=new Date(ts);return `${d.getDate()}/${d.getMonth()+1} เวลา ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;}
+function addLog(status){
+  const elapsed=timerTotal-timerSec;if(elapsed<3)return;
+  _memLogs.unshift({id:Date.now(),name:PRESETS[currentPreset].name,elapsed:fmtTime(elapsed),status,ts:Date.now()});
+  renderLogs();
+}
+function deleteLog(id){_memLogs=_memLogs.filter(l=>l.id!==id);renderLogs();}
+function clearAllLogs(){if(!confirm('ลบประวัติทั้งหมดใช่ไหม?'))return;_memLogs=[];renderLogs();}
+function editLogName(id){
+  const log=_memLogs.find(l=>l.id===id);if(!log)return;
+  const n=prompt('แก้ชื่อรายการ:',log.name);if(n&&n.trim()){log.name=n.trim();renderLogs();}
+}
+function renderLogs(){
+  const ll=document.getElementById('log-list');if(!ll)return;
+  if(!_memLogs.length){ll.innerHTML='<div class="log-empty">ยังไม่มีประวัติ เริ่มทำ Mock Test ได้เลย! 💪</div>';return;}
+  ll.innerHTML='';
+  _memLogs.forEach(l=>{
+    const wrap=document.createElement('div');wrap.style.cssText='position:relative;overflow:hidden;border-radius:10px;margin-bottom:6px';
+    const delBg=document.createElement('div');delBg.style.cssText='position:absolute;right:0;top:0;bottom:0;width:80px;background:#f8c090;display:flex;align-items:center;justify-content:center;border-radius:0 10px 10px 0;font-size:22px;z-index:0';delBg.textContent='🗑️';wrap.appendChild(delBg);
+    const row=document.createElement('div');row.style.cssText='display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:#fff;border-radius:10px;border:1px solid rgba(0,0,0,0.05);transition:transform 0.2s ease;position:relative;z-index:1';
+    row.innerHTML=`<div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:600;color:#2a2c4e;cursor:pointer" onclick="editLogName(${l.id})">${l.name} <span style="font-size:10px;color:#c0c0d8">✏️</span></div><div style="font-size:11px;color:#9090b8;margin-top:2px">${fmtDate(l.ts)} · ใช้เวลา ${l.elapsed}</div></div>
+      <div style="display:flex;align-items:center;gap:6px;flex-shrink:0"><div class="logbadge ${l.status==='done'?'lb-done':'lb-pause'}">${l.status==='done'?'✅ เสร็จ':'⏸ หยุด'}</div><button onclick="deleteLog(${l.id})" style="background:#fde8d0;border:none;border-radius:7px;padding:4px 8px;cursor:pointer;font-size:14px">🗑️</button></div>`;
+    let sx=0,cx=0;
+    row.addEventListener('touchstart',e=>{sx=e.touches[0].clientX;},{passive:true});
+    row.addEventListener('touchmove',e=>{cx=e.touches[0].clientX-sx;if(cx<0)row.style.transform=`translateX(${Math.max(cx,-80)}px)`;},{passive:true});
+    row.addEventListener('touchend',()=>{if(cx<-60)deleteLog(l.id);else row.style.transform='';cx=0;});
+    wrap.appendChild(row);ll.appendChild(wrap);
+  });
+}
+function buildRecap(){
+  const pg=document.getElementById('page-recap');
+  pg.innerHTML=`<div class="sectitle">📝 สูตรและเทคนิค <span class="pill">Pic Recap</span></div>
+  <div class="recaptabs">
+    <button class="rtab active" data-r="rmath" onclick="switchRecap('rmath',this)">🔢 คณิต</button>
+    <button class="rtab" data-r="rlaw" onclick="switchRecap('rlaw',this)">⚖️ กฎหมาย</button>
+    <button class="rtab" data-r="reng" onclick="switchRecap('reng',this)">🇬🇧 อังกฤษ</button>
+    <button class="rtab" data-r="rtip" onclick="switchRecap('rtip',this)">💡 เทคนิค</button>
+  </div>
+  <div id="rmath" class="rpanel active"></div>
+  <div id="rlaw" class="rpanel"></div>
+  <div id="reng" class="rpanel"></div>
+  <div id="rtip" class="rpanel"></div>`;
+  const mf=[
+    {topic:'อนุกรม',col:'pink',main:'อนุกรมเลขคณิต: aₙ = a₁ + (n-1)d',note:'d = ผลต่างร่วม, Sₙ = n/2(a₁+aₙ)',ex:'1,4,7,10... → d=3'},
+    {topic:'อนุกรม',col:'pink',main:'อนุกรมเรขาคณิต: aₙ = a₁·rⁿ⁻¹',note:'r = อัตราส่วนร่วม',ex:'2,6,18,54... → r=3'},
+    {topic:'ร้อยละ',col:'peach',main:'กำไร% = (กำไร/ทุน) × 100',note:'ราคาขาย = ทุน + กำไร',ex:'ทุน 100, ขาย 120 → กำไร 20%'},
+    {topic:'ร้อยละ',col:'peach',main:'ส่วนลด = ราคาปกติ × อัตราส่วนลด%',note:'ราคาจริง = ราคาปกติ - ส่วนลด',ex:'500 ลด 20% → จ่าย 400'},
+    {topic:'ดอกเบี้ย',col:'lav',main:'ดอกเบี้ยอย่างง่าย = PRT/100',note:'P=เงินต้น, R=อัตรา%, T=เวลา(ปี)',ex:'1000×5%×2 = 100 บาท'},
+    {topic:'ดอกเบี้ย',col:'lav',main:'ดอกเบี้ยทบต้น = P(1+r)ⁿ - P',note:'r=อัตรา(ทศนิยม), n=จำนวนงวด',ex:'1000(1.05)² - 1000 = 102.5'},
+    {topic:'สมการ',col:'mint',main:'โจทย์อายุ: กำหนด x=อายุปัจจุบัน',note:'อนาคต +n ปี / อดีต -n ปี',ex:'ปีนี้ x, 5 ปีหน้า = x+5'},
+    {topic:'สถิติ',col:'sky',main:'Mean = ผลรวมทั้งหมด / จำนวน',note:'Median = ค่ากลาง (เรียงลำดับก่อน)',ex:'Mode = ค่าที่ปรากฏบ่อยสุด'},
+    {topic:'พื้นที่',col:'peach',main:'สามเหลี่ยม = ½ × ฐาน × สูง',note:'สี่เหลี่ยมผืนผ้า = กว้าง × ยาว',ex:'วงกลม = πr²'},
+    {topic:'ปริมาตร',col:'mint',main:'ทรงกระบอก = πr²h',note:'ทรงกลม = (4/3)πr³',ex:'ทรงสี่เหลี่ยม = กว้าง×ยาว×สูง'},
+  ];
+  const fg=document.createElement('div');fg.className='fgrid';
+  mf.forEach(f=>{fg.innerHTML+=`<div class="fc"><div class="ftopic ${f.col}">${f.topic}</div><div class="fmain">${f.main}</div><div class="fnote">${f.note}</div>${f.ex?`<div class="fex">✏️ ${f.ex}</div>`:''}</div>`;});
+  document.getElementById('rmath').appendChild(fg);
+  document.getElementById('rlaw').innerHTML=`<div class="fgrid">
+    <div class="fc"><div class="ftopic lav">โครงสร้างราชการ</div><div class="fmain">ส่วนกลาง → ภูมิภาค → ท้องถิ่น</div><div class="fnote">กระทรวง → กรม → จังหวัด → อำเภอ → ตำบล</div></div>
+    <div class="fc"><div class="ftopic lav">ธรรมาภิบาล 6 หลัก</div><div class="fmain">นิติ คุณธรรม โปร่งใส มีส่วนร่วม รับผิดชอบ คุ้มค่า</div><div class="fnote">พ.ร.ฎ. ว่าด้วยหลักเกณฑ์และวิธีการบริหารกิจการบ้านเมืองที่ดี</div></div>
+    <div class="fc"><div class="ftopic sky">กฎหมายปกครอง</div><div class="fmain">คำสั่งทางปกครอง + การอุทธรณ์</div><div class="fnote">อุทธรณ์ภายใน 15 วัน / ฟ้องศาลปกครองภายใน 90 วัน</div></div>
+    <div class="fc"><div class="ftopic sky">ละเมิด</div><div class="fmain">จงใจ/ประมาท → เสียหาย → ชดใช้</div><div class="fnote">หน่วยงานรับผิดแทนเจ้าหน้าที่ก่อน แล้วไล่เบี้ยทีหลัง</div></div>
+    <div class="fc"><div class="ftopic mint">จริยธรรม</div><div class="fmain">มาตรฐานทางจริยธรรม 7 ประการ</div><div class="fnote">ยึดประโยชน์ส่วนรวม / ซื่อสัตย์สุจริต / มีความรับผิดชอบ / โปร่งใส / คุ้มค่า / ไม่เลือกปฏิบัติ / ดำรงตน</div></div>
+    <div class="fc"><div class="ftopic pink">กฎหมายอาญา</div><div class="fmain">โทษ: ประหาร/จำคุก/กักขัง/ปรับ/ริบ</div><div class="fnote">เจตนา = รู้+ประสงค์ผล | ประมาท = ไม่ระมัดระวังเพียงพอ</div></div>
+  </div>`;
+  document.getElementById('reng').innerHTML=`<div class="fgrid">
+    <div class="fc"><div class="ftopic mint">Tenses หลัก</div><div class="fmain">Present Simple: V / V+s/es</div><div class="fnote">Past Simple: V+ed | Future: will+V | Present Perfect: have/has+V3</div></div>
+    <div class="fc"><div class="ftopic mint">Subject-Verb</div><div class="fmain">He/She/It → V+s (Present)</div><div class="fnote">I/You/We/They → V ปกติ | Everyone/Each/Either → V+s</div></div>
+    <div class="fc"><div class="ftopic sky">Conjunctions</div><div class="fmain">Although/Even though = แม้ว่า</div><div class="fnote">Because = เพราะว่า | However = อย่างไรก็ตาม | Therefore = ดังนั้น | Unless = ยกเว้น</div></div>
+    <div class="fc"><div class="ftopic sky">Prepositions</div><div class="fmain">at (จุด) / in (พื้นที่) / on (ผิว)</div><div class="fnote">at 9am / in January / in Bangkok / on Monday / on the table</div></div>
+    <div class="fc"><div class="ftopic peach">Idioms ที่ออกบ่อย</div><div class="fmain">Break a leg = ขอให้โชคดี</div><div class="fnote">Hit the nail on the head = ถูกต้องแม่นยำ | Under the weather = ไม่สบาย | Piece of cake = ง่ายมาก</div></div>
+    <div class="fc"><div class="ftopic peach">Reading Tips</div><div class="fmain">อ่าน Question ก่อน → Scan หา keyword</div><div class="fnote">ไม่ต้องแปลทุกคำ / จับ topic sentence / ดู signal words: but, however, although</div></div>
+  </div>`;
+  document.getElementById('rtip').innerHTML=`<div class="tiplist">
+    <div class="tipc tmath"><div class="tipbadge">คณิตศาสตร์</div><div class="tiptitle">เทคนิคทำโจทย์เร็ว</div><div class="tipbody"><ul>
+      <li>อนุกรม → <span class="hl">ดูผลต่าง</span> 2-3 ตัวแรกก่อน</li>
+      <li>ร้อยละ → <span class="hl">แทนค่า 100</span> แล้วคิดต่อ</li>
+      <li>โจทย์อายุ → <span class="hl">ตั้ง x = อายุปัจจุบัน</span> เสมอ</li>
+      <li>ตาราง → อ่าน <span class="hl">หัวตาราง</span> ก่อน แล้วค่อยดูโจทย์</li>
+      <li>ไม่แน่ใจ → <span class="hl">ตัดตัวเลือกที่ผิดชัดออก</span> แล้วเดา</li>
+    </ul></div></div>
+    <div class="tipc tlogic"><div class="tipbadge">เงื่อนไขสัญลักษณ์</div><div class="tiptitle">วิธีแก้เงื่อนไขสัญลักษณ์</div><div class="tipbody"><ul>
+      <li>อ่านเงื่อนไขให้ครบก่อน <span class="hl">อย่าเพิ่งตัดสิน</span></li>
+      <li>วาดตาราง 2×2 หรือ Venn diagram ช่วย</li>
+      <li>เงื่อนไข "ถ้า A แล้ว B" ≠ "ถ้า B แล้ว A"</li>
+      <li><span class="hl">ระวัง "บางส่วน" vs "ทั้งหมด"</span></li>
+      <li>ฝึกทำ 20 ข้อ/วัน จับเวลาด้วย</li>
+    </ul></div></div>
+    <div class="tipc tlaw"><div class="tipbadge">กฎหมาย</div><div class="tiptitle">จำกฎหมายให้ได้คะแนน</div><div class="tipbody"><ul>
+      <li>จำ <span class="hl">ชื่อกฎหมาย + ปี พ.ศ.</span> ที่ออกบ่อย</li>
+      <li>โครงสร้างราชการ → วาด Mind Map ไว้</li>
+      <li>ทำ 200 ข้อ พี่แมงปอ → จด keyword ที่ผิด</li>
+      <li><span class="hl">จริยธรรม 7 ข้อ</span> ท่องให้ขึ้นใจ</li>
+      <li>อุทธรณ์ 15 วัน / ฟ้องศาล 90 วัน</li>
+    </ul></div></div>
+    <div class="tipc teng"><div class="tipbadge">ภาษาอังกฤษ</div><div class="tiptitle">เทคนิคทำข้อสอบภาษาอังกฤษ</div><div class="tipbody"><ul>
+      <li>Grammar → <span class="hl">ดู Subject ก่อน</span> แล้วเลือก Verb</li>
+      <li>Reading → <span class="hl">อ่าน Question ก่อน Passage</span></li>
+      <li>Vocab → ดู context รอบๆ คำ ช่วยเดาความหมาย</li>
+      <li>บทสนทนา → จำ <span class="hl">สถานการณ์ + response</span> ที่เหมาะสม</li>
+      <li>ท่องผลึก 30 คำ ทุกวัน → ฟังเสียง + ความหมาย</li>
+    </ul></div></div>
+  </div>`;
+}
+function switchRecap(id,btn){
+  document.querySelectorAll('.rtab').forEach(b=>b.classList.remove('active'));btn.classList.add('active');
+  document.querySelectorAll('.rpanel').forEach(p=>p.classList.remove('active'));document.getElementById(id).classList.add('active');
+}
+
+// ══ SAVE PROGRESS — ดาวน์โหลดเป็นไฟล์ HTML ══
+function saveProgress(){
+  const stJSON=JSON.stringify(_memST);
+  const logsJSON=JSON.stringify(_memLogs);
+  const tabStr=_memTab||'calendar';
+  let html=document.documentElement.outerHTML;
+  html=html.replace(/\/\*BAKED_ST_START\*\/[\s\S]*?\/\*BAKED_ST_END\*\//,'/*BAKED_ST_START*/'+stJSON+'/*BAKED_ST_END*/');
+  html=html.replace(/\/\*BAKED_LOGS_START\*\/[\s\S]*?\/\*BAKED_LOGS_END\*\//,'/*BAKED_LOGS_START*/'+logsJSON+'/*BAKED_LOGS_END*/');
+  html=html.replace(/\/\*BAKED_TAB_START\*\/[\s\S]*?\/\*BAKED_TAB_END\*\//,"/*BAKED_TAB_START*/'"+tabStr+"'/*BAKED_TAB_END*/");
+  // ดาวน์โหลดเป็นไฟล์ — ไม่ navigate ออกจากหน้า
+  const blob=new Blob([html],{type:'text/html;charset=utf-8'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url;a.download='study-planner-kpor.html';
+  document.body.appendChild(a);a.click();document.body.removeChild(a);
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+  // แสดง feedback
+  const btn=document.getElementById('save-btn');
+  if(btn){const orig=btn.textContent;btn.textContent='✅ ดาวน์โหลดแล้ว!';setTimeout(()=>{btn.textContent=orig;},2500);}
+}
+
+function initApp(){
+  buildCalendar();buildTodo();buildProgress();buildCountdown();buildTimer();buildRecap();
+  updateGlobalBar();
+  if(_memTab&&_memTab!=='calendar'){
+    const btn=document.querySelector(`.tbtn[onclick="go('${_memTab}',this)"]`);
+    if(btn)go(_memTab,btn);
+  }
+}
+initApp();
+</script>
+
+
+</body></html>
